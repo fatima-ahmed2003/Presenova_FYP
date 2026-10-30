@@ -364,3 +364,20 @@ html:has(.landing-page) { scroll-behavior: smooth; }
   .lp-wave span { animation: none; }
   .mockup-bar-fill { transition: none; }
 }
+.landing-logo {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.landing-logo-img {
+  height: 34px;
+  width: auto;
+  display: block;
+  flex-shrink: 0;
+}
+
+/* Light theme: darken the light-lavender logo for contrast */
+:root.light-theme .landing-logo-img {
+  filter: brightness(0.5) saturate(1.6);
+}

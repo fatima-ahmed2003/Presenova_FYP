@@ -370,8 +370,11 @@ const Login: React.FC = () => {
         <div className="login-card">
           {/* Header */}
           <div className="login-header">
-            <h1>Presenova</h1>
-            <p>AI Presentation Coaching & Analysis Ecosystem</p>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '12px' }}>
+  <img src="/logo-icon.png" alt="Presenova logo" style={{ height: 40, width: 'auto' }} />
+  <h1 style={{ margin: 0 }}>Presenova</h1>
+  </div>
+            <p>Presentation Coaching & Analysis Ecosystem</p>
           </div>
 
           {/* Tabs */}
