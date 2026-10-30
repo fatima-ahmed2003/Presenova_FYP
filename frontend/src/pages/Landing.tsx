@@ -22,14 +22,14 @@ const sevenCs = ['Clear', 'Concise', 'Concrete', 'Correct', 'Coherent', 'Complet
 
 const modules = [
   { title: 'Analyse', text: 'Slides, speech and delivery' },
-  { title: 'Practice', text: 'Live coach and AI rehearsal' },
+  { title: 'Practice', text: 'Live coach and rehearsal' },
   { title: 'Improve', text: 'Rewrite slides and sharpen delivery' },
   { title: 'Prepare', text: 'Viva and defence questions' },
 ];
 
 const steps = [
   { title: 'Upload and set context', text: 'Add slides, documents or a recording and choose the presentation type.' },
-  { title: 'Multimodal analysis', text: 'AI reviews content, speech, gaze, posture and audience fit.' },
+  { title: 'Multimodal analysis', text: 'reviews content, speech, gaze, posture and audience fit.' },
   { title: 'Feedback and coaching', text: 'Get scores, guidance and actions you can use right away.' },
 ];
 
@@ -366,7 +366,7 @@ const Landing: React.FC = () => {
         {/* ── Hero ── */}
         <section className="landing-hero">
           <div className="hero-badge">
-            <span>✨</span> AI-Powered Multimodal Presentation Coach
+            <span>✨</span> Multimodal Presentation Coach
           </div>
 
           <h1 className="hero-headline">
@@ -416,7 +416,7 @@ const Landing: React.FC = () => {
               </div>
 
               <div className="mockup-card">
-                <span className="mockup-card-title">AI practice coach</span>
+                <span className="mockup-card-title">Practice coach</span>
                 <div className="mockup-chat-preview">
                   <div className="mockup-chat-bubble mockup-chat-ai">
                     Your introduction sets up the problem well. Can you state the research gap in one sentence?
@@ -481,7 +481,7 @@ const Landing: React.FC = () => {
             <div>
               <h2 className="section-title lp-left">Meet Presenova</h2>
               <p className="section-subtitle lp-left">
-                One AI-powered platform that analyses your document, your speech and your live
+                One Platform that analyses your document, your speech and your live
                 delivery, then coaches you until you are ready.
               </p>
             </div>
@@ -664,7 +664,7 @@ const Landing: React.FC = () => {
         <section className="landing-section">
           <div className="lp-split">
             <div>
-              <h2 className="section-title lp-left">Interactive AI practice coach</h2>
+              <h2 className="section-title lp-left">Interactive Practice coach</h2>
               <p className="section-subtitle lp-left">
                 Rehearse conversationally. The coach asks, listens, corrects and keeps the thread
                 across turns.
@@ -703,7 +703,7 @@ const Landing: React.FC = () => {
                 </ul>
               </div>
               <div className="lp-panel">
-                <h3 className="lp-h3">AI presentation generator</h3>
+                <h3 className="lp-h3">Pesentation generator</h3>
                 <p className="lp-text">
                   Describe your topic, slide count and audience. Presenova builds a structured PPTX
                   using professional themes.
@@ -837,7 +837,7 @@ const Landing: React.FC = () => {
           </div>
 
           <div className="footer-bottom">
-            <span>Presenova — AI-Powered Presentation Coaching Platform</span>
+            <span>Presenova — Presentation Coaching Platform</span>
             <span>Final Year Project (FYP) © 2026. All rights reserved.</span>
           </div>
         </div>

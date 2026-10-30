@@ -1,7 +1,7 @@
 {
-  "name": "Presenova – AI Presentation Coach",
+  "name": "Presenova – Presentation Coach",
   "short_name": "Presenova",
-  "description": "AI-powered presentation coaching: analyze documents, practice speech, live coaching & slide rewriting.",
+  "description": "Presentation coaching: analyze documents, practice speech, live coaching & slide rewriting.",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#0f0f1a",
