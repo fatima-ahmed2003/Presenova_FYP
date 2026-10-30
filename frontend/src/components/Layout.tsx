@@ -45,7 +45,7 @@ const Layout: React.FC = () => {
       <nav className="navbar">
         <div className="navbar-container">
           <Link to="/analytics" className="navbar-logo" onClick={closeMobileMenu}>
-            <span className="logo-badge">⚡</span>
+            <img src="/logo-icon.png" alt="Presenova logo" className="navbar-logo-img" />
             <span>Presenova</span>
           </Link>
 

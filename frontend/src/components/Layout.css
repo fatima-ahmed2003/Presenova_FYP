@@ -41,13 +41,26 @@
 .navbar-logo {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: 0.6rem;
   font-size: 1.15rem;
   font-weight: 700;
   color: var(--text);
   font-family: var(--font-heading);
   letter-spacing: -0.015em;
   white-space: nowrap;
+}
+
+/* Logo icon (book) shown next to the "Presenova" text */
+.navbar-logo-img {
+  height: 34px;
+  width: auto;
+  display: block;
+  flex-shrink: 0;
+}
+
+/* The logo is light lavender, so darken it on the light theme for contrast */
+:root.light-theme .navbar-logo-img {
+  filter: brightness(0.5) saturate(1.6);
 }
 
 .logo-badge {
@@ -330,6 +343,10 @@
     padding: 0.65rem 1rem;
   }
 
+  .navbar-logo-img {
+    height: 30px;
+  }
+
   .main-content {
     margin: 1rem auto;
     padding: 0 0.85rem;
@@ -365,4 +382,3 @@
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
-
