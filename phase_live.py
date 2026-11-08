@@ -1438,7 +1438,19 @@ def submit_presentation():
             topic=session.topic,
             report_json=report_json
         )
-        
+                # Also store in the main reports collection so the dashboard history shows Live Coach sessions
+        try:
+            from models import Report as _DashboardReport
+            _dashboard_json = dict(report_json)
+            _dashboard_json.setdefault("topic", session.topic)
+            _DashboardReport.create(
+                report_json=_dashboard_json,
+                report_type="live_coaching",
+                user_id=user_id,
+            )
+        except Exception as _dash_err:
+            import logging
+            logging.getLogger(__name__).warning("Dashboard history save skipped: %s", _dash_err)
         # Update session status
         session.update_status("FINISHED")
         

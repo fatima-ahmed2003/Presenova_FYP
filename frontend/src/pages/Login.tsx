@@ -11,7 +11,7 @@
  */
 
 import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, Link } from 'react-router-dom';
 import { 
   firebaseLogin, 
   login as flaskLogin, 
@@ -370,10 +370,22 @@ const Login: React.FC = () => {
         <div className="login-card">
           {/* Header */}
           <div className="login-header">
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '12px' }}>
-  <img src="/logo-icon.png" alt="Presenova logo" style={{ height: 40, width: 'auto' }} />
-  <h1 style={{ margin: 0 }}>Presenova</h1>
-  </div>
+            <Link
+              to="/"
+              title="Back to home"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '12px',
+                textDecoration: 'none',
+                color: 'inherit',
+                cursor: 'pointer',
+              }}
+            >
+              <img src="/logo-icon.png" alt="Presenova logo" style={{ height: 40, width: 'auto' }} />
+              <h1 style={{ margin: 0 }}>Presenova</h1>
+            </Link>
             <p>Presentation Coaching & Analysis Ecosystem</p>
           </div>
 

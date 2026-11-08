@@ -1,0 +1,225 @@
+/* ===== Dashboard chart cards, range dropdowns and Quick Tip (mockup style) ===== */
+
+.chart-container-card {
+  padding: 1.6rem 1.8rem;
+  background: linear-gradient(145deg, rgba(30, 41, 90, 0.45), rgba(10, 15, 40, 0.75));
+  border: 1px solid rgba(99, 102, 241, 0.3);
+  box-shadow: 0 0 18px rgba(99, 102, 241, 0.08);
+}
+
+.chart-head {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  margin-bottom: 1.2rem;
+}
+
+.chart-icon {
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: rgba(79, 70, 229, 0.28);
+  border: 1px solid rgba(129, 140, 248, 0.35);
+  color: #c4b5fd;
+}
+
+.chart-head-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.chart-head-text h3 {
+  font-size: 1.1rem;
+  margin: 0;
+}
+
+.chart-head-text .chart-subtitle {
+  margin: 0.2rem 0 0;
+  font-size: 0.8rem;
+}
+
+/* Date range dropdown */
+.range-select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-color: rgba(15, 23, 60, 0.8);
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23a5b4fc' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 0.7rem center;
+  color: var(--text-main);
+  border: 1px solid rgba(99, 102, 241, 0.4);
+  border-radius: 10px;
+  padding: 0.45rem 2rem 0.45rem 0.9rem;
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+  outline: none;
+  flex-shrink: 0;
+}
+
+.range-select:hover,
+.range-select:focus {
+  border-color: #22d3ee;
+}
+
+.range-select option {
+  background: #0f172a;
+  color: #f8fafc;
+}
+
+/* Pace chart legend */
+.chart-legend-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1.8rem;
+  margin-top: 0.8rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.legend-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #22d3ee;
+  margin-right: 0.4rem;
+}
+
+.legend-box {
+  display: inline-block;
+  width: 14px;
+  height: 10px;
+  border: 1.5px dashed #22d3ee;
+  border-radius: 2px;
+  margin-right: 0.4rem;
+}
+
+/* Empty state inside chart cards */
+.chart-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  min-height: 250px;
+  padding: 1.5rem;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.92rem;
+  border: 1px dashed rgba(129, 140, 248, 0.3);
+  border-radius: var(--border-radius-sm);
+  background: rgba(10, 15, 40, 0.4);
+}
+
+.chart-empty p {
+  margin: 0;
+  max-width: 320px;
+}
+
+/* Pill buttons (empty state + quick tip) */
+.chart-empty-btn,
+.quick-tip-btn {
+  background: transparent;
+  color: #a5b4fc;
+  border: 1px solid rgba(99, 102, 241, 0.55);
+  border-radius: 999px;
+  padding: 0.5rem 1.2rem;
+  font-weight: 600;
+  font-size: 0.85rem;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.2s ease;
+}
+
+.chart-empty-btn:hover,
+.quick-tip-btn:hover {
+  background: rgba(99, 102, 241, 0.2);
+  border-color: #22d3ee;
+  color: #ffffff;
+}
+
+/* Quick Tip bar */
+.quick-tip {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-top: 1.5rem;
+  padding: 1.1rem 1.5rem;
+  border-radius: var(--border-radius-md);
+  background: linear-gradient(120deg, rgba(49, 46, 129, 0.55), rgba(15, 23, 60, 0.75));
+  border: 1px solid rgba(99, 102, 241, 0.4);
+}
+
+.quick-tip-icon {
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: rgba(79, 70, 229, 0.3);
+  border: 1px solid rgba(129, 140, 248, 0.35);
+  color: #fde68a;
+}
+
+.quick-tip-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.quick-tip-text h4 {
+  margin: 0;
+  font-size: 1rem;
+  color: var(--text-main);
+}
+
+.quick-tip-text p {
+  margin: 0.2rem 0 0;
+  font-size: 0.88rem;
+  color: var(--text-muted);
+}
+
+/* Light theme */
+:root.light-theme .chart-container-card {
+  background: linear-gradient(145deg, #ffffff, #f1f0ff);
+  border-color: rgba(139, 92, 246, 0.25);
+  box-shadow: 0 4px 16px rgba(99, 102, 241, 0.08);
+}
+
+:root.light-theme .range-select {
+  background-color: #ffffff;
+}
+
+:root.light-theme .range-select option {
+  background: #ffffff;
+  color: #0f172a;
+}
+
+:root.light-theme .quick-tip {
+  background: linear-gradient(120deg, #ede9fe, #f1f5ff);
+}
+
+:root.light-theme .chart-empty {
+  background: rgba(255, 255, 255, 0.6);
+}
+
+@media (max-width: 768px) {
+  .chart-head {
+    flex-wrap: wrap;
+  }
+
+  .quick-tip {
+    flex-wrap: wrap;
+  }
+
+  .quick-tip-btn {
+    width: 100%;
+  }
+}
