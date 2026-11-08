@@ -26,20 +26,58 @@ import { useAuth } from '../context/AuthContext';
 import { getUserHistory, ReportItem } from '../services/api';
 import './Analytics.css';
 import './AnalyticsCharts.css';
+import './AnalyticsHistory.css';
 
 interface ChartDataPoint {
   date: string;
+  ts: number;
   score: number;
   type: string;
 }
 
 interface SpeechDataPoint {
   date: string;
+  ts: number;
   wpm: number;
   fillerWords: number;
 }
 
 type RangeKey = '7d' | '30d' | 'all';
+type FilterKey = 'all' | 'document' | 'speech' | 'rewriter' | 'generator' | 'live';
+
+interface TypeMeta {
+  label: string;
+  cls: string;
+  filter: FilterKey;
+}
+
+// One place that decides label, badge colour and filter group for every report type
+const getTypeMeta = (type: string): TypeMeta => {
+  switch (type) {
+    case 'document_analysis':
+      return { label: 'Document Analyzer', cls: 'badge-doc', filter: 'document' };
+    case 'speech_analysis':
+      return { label: 'Speech Analyzer', cls: 'badge-speech', filter: 'speech' };
+    case 'presentation_analysis':
+    case 'presentation_rewrite':
+      return { label: 'Rewriter', cls: 'badge-rewrite', filter: 'rewriter' };
+    case 'presentation_generated':
+      return { label: 'Generator', cls: 'badge-gen', filter: 'generator' };
+    case 'live_coaching':
+      return { label: 'Live Coach', cls: 'badge-live', filter: 'live' };
+    default:
+      return { label: 'Session', cls: 'badge-doc', filter: 'all' };
+  }
+};
+
+const FILTER_TABS: { key: FilterKey; label: string }[] = [
+  { key: 'all', label: 'All' },
+  { key: 'document', label: 'Document' },
+  { key: 'speech', label: 'Speech' },
+  { key: 'rewriter', label: 'Rewriter' },
+  { key: 'generator', label: 'Generator' },
+  { key: 'live', label: 'Live Coach' },
+];
 
 const Analytics: React.FC = () => {
   const navigate = useNavigate();
@@ -51,6 +89,9 @@ const Analytics: React.FC = () => {
 
   // Dashboard navigation tabs: 'overview' (charts) vs 'history' (list of past reports)
   const [activeTab, setActiveTab] = useState<'overview' | 'history'>('overview');
+
+  // History filter tab
+  const [historyFilter, setHistoryFilter] = useState<FilterKey>('all');
 
   // Global theme toggle: 'dark' (default) vs 'light'
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
@@ -135,6 +176,25 @@ const Analytics: React.FC = () => {
     return json || {};
   };
 
+  // Helper: find a numeric score in a report, or null if the report has none
+  const getScore = (r: ReportItem): number | null => {
+    const j = getSafeReportJson(r);
+    const candidates = [
+      j.overall_score,
+      j.score,
+      j.final_score,
+      j.session_metrics?.overall_score,
+      j.clarity_score,
+    ];
+    const found = candidates.find((c) => typeof c === 'number' && !isNaN(c));
+    return typeof found === 'number' ? Math.round(found) : null;
+  };
+
+  const getDisplayName = (r: ReportItem): string => {
+    const j = getSafeReportJson(r);
+    return j.presentation_title || j.document_name || j.topic || j.title || 'Presentation Analysis';
+  };
+
   const handleRefresh = async () => {
     setLoading(true);
     try {
@@ -196,89 +256,82 @@ const Analytics: React.FC = () => {
     (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
   );
 
-  const documentReports = sortedReports.filter(
-    (r) => r.report_type === 'document_analysis' || r.report_type === 'presentation_analysis' || r.report_type === 'presentation_rewrite'
-  );
-  const speechReports = sortedReports.filter(
-    (r) => r.report_type === 'speech_analysis' || r.report_type === 'live_coaching'
-  );
+  // Group A: documents, rewriter and generator. Group B: speech and live coach.
+  const isDocType = (t: string) =>
+    t === 'document_analysis' ||
+    t === 'presentation_analysis' ||
+    t === 'presentation_rewrite' ||
+    t === 'presentation_generated';
+  const isSpeechType = (t: string) => t === 'speech_analysis' || t === 'live_coaching';
 
-  // 1. Overall Score History Data
-  const scoreHistoryData: ChartDataPoint[] = sortedReports.map((r) => {
-    const dateStr = new Date(r.created_at).toLocaleDateString([], {
-      month: 'short',
-      day: 'numeric',
-    });
+  const documentReports = sortedReports.filter((r) => isDocType(r.report_type));
+  const speechReports = sortedReports.filter((r) => isSpeechType(r.report_type));
 
-    const rJson = getSafeReportJson(r);
-    const isDoc = r.report_type === 'document_analysis' || r.report_type === 'presentation_analysis' || r.report_type === 'presentation_rewrite';
-    const score = isDoc
-      ? rJson.overall_score || 75
-      : rJson.overall_score || rJson.clarity_score || 70;
-
-    return {
-      date: dateStr,
-      score: typeof score === 'number' ? score : 75,
-      type: isDoc ? 'Presentation / Document' : 'Speech',
-    };
-  });
+  // 1. Overall Score History Data (only reports that really have a score)
+  const scoreHistoryData: ChartDataPoint[] = sortedReports
+    .map((r) => {
+      const score = getScore(r);
+      if (score === null) return null;
+      const ts = new Date(r.created_at).getTime();
+      return {
+        date: new Date(r.created_at).toLocaleDateString([], { month: 'short', day: 'numeric' }),
+        ts,
+        score,
+        type: getTypeMeta(r.report_type).label,
+      } as ChartDataPoint;
+    })
+    .filter((d): d is ChartDataPoint => d !== null);
 
   // 2. Speech Pacing & Filler Word Data
   const speechPacingData: SpeechDataPoint[] = speechReports.map((r) => {
-    const dateStr = new Date(r.created_at).toLocaleDateString([], {
-      month: 'short',
-      day: 'numeric',
-    });
-
     const rJson = getSafeReportJson(r);
     const wpm = rJson.speech_speed_wpm || rJson.session_metrics?.avg_wpm || 0;
     const fillers = rJson.filler_words_count || rJson.session_metrics?.total_fillers || 0;
 
     return {
-      date: dateStr,
+      date: new Date(r.created_at).toLocaleDateString([], { month: 'short', day: 'numeric' }),
+      ts: new Date(r.created_at).getTime(),
       wpm: typeof wpm === 'number' ? wpm : 0,
       fillerWords: typeof fillers === 'number' ? fillers : 0,
     };
   });
 
-  // 3. Category Average Scores (for latest document)
-  const latestDoc = documentReports[documentReports.length - 1];
+  // 3. Category Average Scores (latest document that has category scores)
+  const latestDoc = [...documentReports]
+    .reverse()
+    .find((r) => {
+      const cs = getSafeReportJson(r).category_scores;
+      return cs && typeof cs === 'object';
+    });
   const latestDocJson = latestDoc ? getSafeReportJson(latestDoc) : null;
   const categoryScoresData = latestDocJson && latestDocJson.category_scores && typeof latestDocJson.category_scores === 'object'
     ? Object.entries(latestDocJson.category_scores).map(([category, score]) => ({
         category: category.replace(/_/g, ' '),
         score: typeof score === 'number' ? score : 0,
       }))
-    : [
-        { category: 'Structure', score: 0 },
-        { category: 'Clarity', score: 0 },
-        { category: 'Persuasion', score: 0 },
-        { category: 'Content Quality', score: 0 },
-        { category: 'Call to Action', score: 0 },
-      ];
+    : [];
 
   // ===== STATS CALCULATIONS =====
   const totalDocs = documentReports.length;
   const totalSpeeches = speechReports.length;
 
-  const avgDocScore = totalDocs > 0
-    ? Math.round(documentReports.reduce((sum, r) => sum + (getSafeReportJson(r).overall_score || 0), 0) / totalDocs)
-    : 0;
+  const averageScore = (list: ReportItem[]): number => {
+    const scores = list.map(getScore).filter((s): s is number => s !== null);
+    return scores.length > 0 ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : 0;
+  };
 
-  const avgSpeechScore = totalSpeeches > 0
-    ? Math.round(speechReports.reduce((sum, r) => {
-        const rJson = getSafeReportJson(r);
-        const score = rJson.overall_score || rJson.clarity_score || 70;
-        return sum + (typeof score === 'number' ? score : 70);
-      }, 0) / totalSpeeches)
-    : 0;
+  const avgDocScore = averageScore(documentReports);
+  const avgSpeechScore = averageScore(speechReports);
 
-  const avgWpm = totalSpeeches > 0
-    ? Math.round(speechReports.reduce((sum, r) => {
-        const rJson = getSafeReportJson(r);
-        const wpm = rJson.speech_speed_wpm || rJson.session_metrics?.avg_wpm || 0;
-        return sum + (typeof wpm === 'number' ? wpm : 0);
-      }, 0) / totalSpeeches)
+  const wpmValues = speechReports
+    .map((r) => {
+      const rJson = getSafeReportJson(r);
+      const wpm = rJson.speech_speed_wpm || rJson.session_metrics?.avg_wpm || 0;
+      return typeof wpm === 'number' ? wpm : 0;
+    })
+    .filter((w) => w > 0);
+  const avgWpm = wpmValues.length > 0
+    ? Math.round(wpmValues.reduce((a, b) => a + b, 0) / wpmValues.length)
     : 0;
 
   // ===== WEEKLY TREND + OVERALL RING (for stat cards) =====
@@ -290,9 +343,9 @@ const Analytics: React.FC = () => {
     (r) => new Date(r.created_at).getTime() >= oneWeekAgo
   ).length;
 
-  const scoredGroups = (totalDocs > 0 ? 1 : 0) + (totalSpeeches > 0 ? 1 : 0);
+  const scoredGroups = (avgDocScore > 0 ? 1 : 0) + (avgSpeechScore > 0 ? 1 : 0);
   const overallScore = scoredGroups > 0
-    ? Math.round(((totalDocs > 0 ? avgDocScore : 0) + (totalSpeeches > 0 ? avgSpeechScore : 0)) / scoredGroups)
+    ? Math.round((avgDocScore + avgSpeechScore) / scoredGroups)
     : 0;
   const ringCircumference = 2 * Math.PI * 26;
   const ringOffset = ringCircumference * (1 - overallScore / 100);
@@ -301,11 +354,9 @@ const Analytics: React.FC = () => {
   const rangeCutoff = (range: RangeKey) =>
     range === 'all' ? 0 : Date.now() - (range === '7d' ? 7 : 30) * 24 * 60 * 60 * 1000;
 
-  const scoreChartData = scoreHistoryData.filter(
-    (_, i) => new Date(sortedReports[i].created_at).getTime() >= rangeCutoff(scoreRange)
-  );
+  const scoreChartData = scoreHistoryData.filter((d) => d.ts >= rangeCutoff(scoreRange));
   const paceChartData = speechPacingData
-    .filter((_, i) => new Date(speechReports[i].created_at).getTime() >= rangeCutoff(paceRange))
+    .filter((d) => d.ts >= rangeCutoff(paceRange))
     .filter((d) => d.wpm > 0);
 
   const tooltipStyle = {
@@ -316,13 +367,24 @@ const Analytics: React.FC = () => {
   };
 
   const quickTip =
-    totalSpeeches === 0
+    avgWpm === 0
       ? 'Record your first speech to unlock pacing and filler-word insights.'
       : avgWpm > 160
         ? `You are speaking at about ${avgWpm} wpm. Slow down a little to stay clear and easy to follow.`
         : avgWpm < 100
           ? `You are speaking at about ${avgWpm} wpm. Try picking up the pace to keep your audience engaged.`
           : `Keep your speaking pace steady around ${avgWpm} wpm. It helps you sound confident and easy to follow.`;
+
+  // ===== HISTORY FILTERING =====
+  const filterCount = (key: FilterKey) =>
+    key === 'all'
+      ? historyReports.length
+      : historyReports.filter((r) => getTypeMeta(r.report_type).filter === key).length;
+
+  const visibleHistory =
+    historyFilter === 'all'
+      ? historyReports
+      : historyReports.filter((r) => getTypeMeta(r.report_type).filter === historyFilter);
 
   return (
     <div className="analytics-page">
@@ -447,7 +509,7 @@ const Analytics: React.FC = () => {
                 <h4>Average Speaking Pace</h4>
                 <div className="stat-value">{avgWpm} <span className="stat-unit">wpm</span></div>
                 <p className="stat-subtext">
-                  {avgWpm > 160 ? 'Too Fast' : avgWpm < 100 ? 'Too Slow' : 'Optimal Pace'}
+                  {avgWpm === 0 ? 'No pace data yet' : avgWpm > 160 ? 'Too Fast' : avgWpm < 100 ? 'Too Slow' : 'Optimal Pace'}
                 </p>
               </div>
               <svg className="stat-chevron" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
@@ -647,7 +709,7 @@ const Analytics: React.FC = () => {
                   <p className="chart-subtitle">Score breakdown per category for your most recent document.</p>
                 </div>
               </div>
-              {latestDoc ? (
+              {latestDoc && categoryScoresData.length > 0 ? (
                 <div className="chart-wrapper">
                   <ResponsiveContainer width="100%" height={300}>
                     <BarChart data={categoryScoresData} margin={{ top: 24, right: 24, left: -10, bottom: 0 }}>
@@ -721,14 +783,28 @@ const Analytics: React.FC = () => {
       {activeTab === 'history' && (
         <div className="history-tab-content fadeIn">
           <h2>Your Presentation Analysis History</h2>
-          <p className="section-desc">Look up previous document rewrites, recorded speech reports, or live sessions to see detailed scores and recommendations.</p>
+          <p className="section-desc">Look up previous document analyses, rewrites, generated presentations, speech reports, or live sessions to see detailed scores and recommendations.</p>
 
-          {historyReports.length > 0 ? (
+          {/* Filter tabs */}
+          <div className="history-filters">
+            {FILTER_TABS.map((tab) => (
+              <button
+                key={tab.key}
+                className={`filter-chip ${historyFilter === tab.key ? 'active' : ''}`}
+                onClick={() => setHistoryFilter(tab.key)}
+              >
+                {tab.label}
+                <span className="filter-count">{filterCount(tab.key)}</span>
+              </button>
+            ))}
+          </div>
+
+          {visibleHistory.length > 0 ? (
             <div className="history-table-wrapper">
               <table className="history-table">
                 <thead>
                   <tr>
-                    <th>Type</th>
+                    <th>Feature</th>
                     <th>Topic / Filename</th>
                     <th>Date & Time</th>
                     <th>Score</th>
@@ -736,28 +812,17 @@ const Analytics: React.FC = () => {
                   </tr>
                 </thead>
                 <tbody>
-                  {historyReports.map((report) => {
-                    const isDoc = report.report_type === 'document_analysis' || report.report_type === 'presentation_analysis' || report.report_type === 'presentation_rewrite';
-                    const isLive = report.report_type === 'live_coaching';
-                    const score = isDoc
-                      ? report.report_json.overall_score || 75
-                      : report.report_json.overall_score || report.report_json.clarity_score || 70;
-
-                    const displayName = report.report_json.presentation_title || report.report_json.document_name || report.report_json.topic || 'Presentation Analysis';
-
-                    const typeBadge = isDoc
-                      ? { label: report.report_type === 'presentation_analysis' ? 'Presentation' : 'Document', class: 'badge-doc' }
-                      : isLive
-                        ? { label: 'Live Coach', class: 'badge-live' }
-                        : { label: 'Speech Practice', class: 'badge-speech' };
+                  {visibleHistory.map((report) => {
+                    const score = getScore(report);
+                    const meta = getTypeMeta(report.report_type);
 
                     return (
                       <tr key={report.id} className="history-row">
                         <td>
-                          <span className={`badge-pill ${typeBadge.class}`}>{typeBadge.label}</span>
+                          <span className={`badge-pill ${meta.cls}`}>{meta.label}</span>
                         </td>
                         <td className="history-name-cell">
-                          <strong>{displayName}</strong>
+                          <strong>{getDisplayName(report)}</strong>
                         </td>
                         <td className="history-date-cell">
                           {new Date(report.created_at).toLocaleString([], {
@@ -769,9 +834,13 @@ const Analytics: React.FC = () => {
                           })}
                         </td>
                         <td>
-                          <span className={`history-score ${score >= 80 ? 'score-high' : score >= 60 ? 'score-med' : 'score-low'}`}>
-                            {score}/100
-                          </span>
+                          {score !== null ? (
+                            <span className={`history-score ${score >= 80 ? 'score-high' : score >= 60 ? 'score-med' : 'score-low'}`}>
+                              {score}/100
+                            </span>
+                          ) : (
+                            <span className="history-score score-none">—</span>
+                          )}
                         </td>
                         <td style={{ textAlign: 'right' }}>
                           <button
@@ -790,8 +859,8 @@ const Analytics: React.FC = () => {
           ) : (
             <div className="no-history-box">
               <div className="placeholder-icon">📋</div>
-              <h3>No past history records found</h3>
-              <p>Upload slides or complete a speech recording session to start tracking your runs!</p>
+              <h3>{historyFilter === 'all' ? 'No past history records found' : 'Nothing saved for this feature yet'}</h3>
+              <p>Use the features and your sessions will show up here automatically.</p>
             </div>
           )}
         </div>
@@ -800,27 +869,26 @@ const Analytics: React.FC = () => {
       {/* OVERLAY DETAIL MODAL FOR HISTORICAL RUNS */}
       {activeReport && (() => {
         const activeJson = getSafeReportJson(activeReport);
-        const modalScore = activeReport.report_type === 'document_analysis'
-          ? activeJson.overall_score || 75
-          : activeJson.overall_score || activeJson.clarity_score || 70;
+        const modalScore = getScore(activeReport);
+        const modalMeta = getTypeMeta(activeReport.report_type);
         const recommendations = Array.isArray(activeJson.recommendations) ? activeJson.recommendations : [];
 
         return (
           <div className="report-modal-overlay" onClick={() => setActiveReport(null)}>
             <div className="report-modal-content fadeIn" onClick={(e) => e.stopPropagation()}>
               <div className="modal-header">
-                <span className={`modal-badge ${activeReport.report_type === 'document_analysis' ? 'badge-doc' : activeReport.report_type === 'live_coaching' ? 'badge-live' : 'badge-speech'}`}>
-                  {activeReport.report_type === 'document_analysis' ? 'Document Analysis' : activeReport.report_type === 'live_coaching' ? 'Live Practice' : 'Speech Practice'}
+                <span className={`modal-badge badge-pill ${modalMeta.cls}`}>
+                  {modalMeta.label}
                 </span>
                 <button className="modal-close-btn" onClick={() => setActiveReport(null)}>✕</button>
               </div>
 
-              <h2 className="modal-title">{activeJson.document_name || activeJson.presentation_title || activeJson.topic || 'Presentation Session'}</h2>
-              <p className="modal-date">Analyzed on: {new Date(activeReport.created_at).toLocaleString()}</p>
+              <h2 className="modal-title">{getDisplayName(activeReport)}</h2>
+              <p className="modal-date">Saved on: {new Date(activeReport.created_at).toLocaleString()}</p>
 
               <div className="modal-score-section">
                 <div className="modal-score-circle">
-                  <span className="score-num">{modalScore}</span>
+                  <span className="score-num">{modalScore !== null ? modalScore : '—'}</span>
                   <span className="score-lbl">Score</span>
                 </div>
                 <div className="modal-feedback-box">

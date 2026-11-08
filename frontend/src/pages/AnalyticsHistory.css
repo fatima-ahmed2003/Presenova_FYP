@@ -1,0 +1,76 @@
+﻿/* ===== History filters + new feature badges ===== */
+.badge-pill {
+  white-space: nowrap;
+}
+
+.badge-rewrite {
+  background: rgba(245, 158, 11, 0.15);
+  color: #fbbf24;
+  border-color: rgba(245, 158, 11, 0.3);
+}
+
+.badge-gen {
+  background: rgba(34, 211, 238, 0.14);
+  color: #22d3ee;
+  border-color: rgba(34, 211, 238, 0.3);
+}
+
+.score-none {
+  color: var(--text-muted);
+}
+
+.history-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-bottom: 0.4rem;
+}
+
+.filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  color: var(--text-muted);
+  padding: 0.5rem 1rem;
+  border-radius: 99px;
+  font-weight: 600;
+  font-size: 0.88rem;
+  cursor: pointer;
+  transition: var(--transition-smooth);
+}
+
+.filter-chip:hover {
+  color: var(--text-main);
+  border-color: rgba(139, 92, 246, 0.4);
+}
+
+.filter-chip.active {
+  background: rgba(139, 92, 246, 0.2);
+  border-color: #8b5cf6;
+  color: #c4b5fd;
+}
+
+.filter-count {
+  min-width: 22px;
+  padding: 0.05rem 0.45rem;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.08);
+  font-size: 0.75rem;
+  text-align: center;
+}
+
+:root.light-theme .filter-chip.active {
+  color: #6d28d9;
+}
+
+:root.light-theme .filter-count {
+  background: rgba(0, 0, 0, 0.06);
+}
+
+@media (max-width: 768px) {
+  .history-table-wrapper {
+    overflow-x: auto;
+  }
+}
