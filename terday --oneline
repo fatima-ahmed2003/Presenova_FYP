@@ -1,0 +1,103 @@
+warning: in the working copy of '.gitignore', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/.gitignore b/.gitignore[m
+[1mindex b2eee3d..91eea11 100644[m
+[1m--- a/.gitignore[m
+[1m+++ b/.gitignore[m
+[36m@@ -83,3 +83,5 @@[m [mfirebase-service-account.json[m
+ [m
+ *.exe[m
+ !frontend/public/downloads/*.exe[m
+[32m+[m
+[32m+[m[32mfirebase-service-account.json[m
+[1mdiff --git a/ai_evaluator.py b/ai_evaluator.py[m
+[1mindex c7520cb..bc3e918 100644[m
+[1m--- a/ai_evaluator.py[m
+[1m+++ b/ai_evaluator.py[m
+[36m@@ -45,6 +45,15 @@[m [melse:[m
+     logger.warning("[AI WARN] Global AI Evaluator: GEMINI_API_KEY not configured or offline. Running with smart fallbacks.")[m
+ [m
+ [m
+[32m+[m[32mdef _local_clean_transcript(text: str) -> str:[m
+[32m+[m[32m    """Safety net: remove fillers and back-to-back repeats WITHOUT adding any new words."""[m
+[32m+[m[32m    t = re.sub(r'\b(um+|uh+|erm|err)\b[,]?\s*', '', text, flags=re.I)[m
+[32m+[m[32m    t = re.sub(r'\b(you know|basically|actually|kind of)\b[,]?\s*', '', t, flags=re.I)[m
+[32m+[m[32m    t = re.sub(r'\b(\w+)(\s+\1\b)+', r'\1', t, flags=re.I)[m
+[32m+[m[32m    t = re.sub(r'\s+', ' ', t).strip()[m
+[32m+[m[32m    return t[:1].upper() + t[1:] if t else t[m
+[32m+[m
+[32m+[m
+ def evaluate_7cs(text: str, module_type: str, context_metrics: dict) -> dict:[m
+     """[m
+     Evaluates text (document slides, transcripts, or live presentation speech)[m
+[36m@@ -168,7 +177,9 @@[m [mdef evaluate_7cs(text: str, module_type: str, context_metrics: dict) -> dict:[m
+         if overall_score < 60:[m
+             dynamic_strengths = [[m
+                 f"Document contains {word_count} words — content exists and can be refined.",[m
+[31m-                f"Grammar score: {computed_grammar_score}/100 ({grammar_adj}) — " + ("some positive aspects" if computed_grammar_score >= 60 else "significant room for improvement."),[m
+[32m+[m[32m                (f"Grammar score: {computed_grammar_score}/100 — some positive aspects."[m
+[32m+[m[32m                 if computed_grammar_score >= 60 else[m
+[32m+[m[32m                 f"Content covers {word_count} words with identifiable structure, though grammar needs work."),[m
+                 "Core topic intent is identifiable even in current state."[m
+             ][m
+             dynamic_recs = [[m
+[36m@@ -195,7 +206,7 @@[m [mdef evaluate_7cs(text: str, module_type: str, context_metrics: dict) -> dict:[m
+                 "Concrete": max(20, overall_score - 8),[m
+                 "Consistent": max(20, overall_score - 14)[m
+             }[m
+[31m-            grammar_note_text = grammar_summary_text[:200] if grammar_summary_text else 'See detailed grammar report.'[m
+[32m+[m[32m            grammar_note_text = grammar_summary_text[:600] if grammar_summary_text else 'See detailed grammar report.'[m
+             grammar_detail_low = ([m
+                 'No significant grammar issues detected.'[m
+                 if not grammar_issues[m
+[36m@@ -216,7 +227,9 @@[m [mdef evaluate_7cs(text: str, module_type: str, context_metrics: dict) -> dict:[m
+         else:[m
+             dynamic_strengths = [[m
+                 f"Content depth is {depth_adj}: {word_count} words provide {'comprehensive' if word_count > 300 else 'adequate'} coverage.",[m
+[31m-                f"Grammar quality is {grammar_adj} at {computed_grammar_score}/100 (Grade {_grammar_grade(computed_grammar_score)}).",[m
+[32m+[m[32m                (f"Grammar quality is {grammar_adj} at {computed_grammar_score}/100 (Grade {_grammar_grade(computed_grammar_score)})."[m
+[32m+[m[32m if computed_grammar_score >= 70 else[m
+[32m+[m[32m f"Content is complete at {word_count} words, though grammar needs attention."),[m
+                 f"Sentence structure is {variety_adj} (variety score: {sentence_variety_score}/100)."[m
+             ][m
+             dynamic_recs = [[m
+[36m@@ -243,7 +256,7 @@[m [mdef evaluate_7cs(text: str, module_type: str, context_metrics: dict) -> dict:[m
+                 "Concrete": min(100, overall_score + 1),[m
+                 "Consistent": min(100, overall_score + 2)[m
+             }[m
+[31m-            grammar_review_text = grammar_summary_text[:150] if grammar_summary_text else 'Review the grammar report.'[m
+[32m+[m[32m            grammar_review_text = grammar_summary_text[:600] if grammar_summary_text else 'Review the grammar report.'[m
+             grammar_detail_high = ([m
+                 'No grammar issues detected — excellent writing quality.'[m
+                 if not grammar_issues[m
+[36m@@ -632,6 +645,8 @@[m [mTotal Grammar/Spelling Issues Detected: {len(grammar_issues)}[m
+ You are an expert presentation coach and public speaking/communication consultant. Your job is to analyze the following speech transcript, identify all errors, grammatical mistakes, verbal pacing issues, and assess how well it adheres to the 7 Cs of Communication (Clear, Concise, Correct, Complete, Courteous, Concrete, Consistent).[m
+ [m
+ IMPORTANT: A grammar pre-analysis has already been performed using LanguageTool. The grammar quality score is {computed_grammar_score}/100 based on {len(grammar_issues)} detected issues. Use this data to calibrate the 'Correct' dimension accurately.{grammar_section}[m
+[32m+[m[32mTRANSCRIPT RELIABILITY: This transcript comes from automatic speech recognition (ASR) and may contain recognition errors (wrong or odd words). Do NOT blame the speaker for words that look like ASR mistakes, and do NOT invent or assume what the speaker meant. Judge only delivery: pacing, fillers, structure, and clarity of ideas. Never introduce technical terms or product details the speaker did not say.[m
+[32m+[m
+ We have also calculated the following real-time speaking metrics from the audio recording for your context:[m
+ - Speaking pace: {speech_speed_wpm} WPM (optimal: 120-160 WPM)[m
+ - Filler words count: {filler_count} instances (filler percentage: {filler_percentage:.1f}%)[m
+[36m@@ -680,7 +695,7 @@[m [mJSON Schema:[m
+     "<actionable recommendations/corrections 3 with specific detail>"[m
+   ],[m
+   "detailed_feedback": "<2-3 paragraph comprehensive analysis pointing out specific vocal flaws, grammar issues (mention grammar score {computed_grammar_score}/100), pacing problems, and recommendations>",[m
+[31m-  "improved_text": "<Complete, professional rewrite of the transcript. Remove all filler words (um, like, basically), repetitions, correct any grammatical errors, and format it with clear structural headings. This rewrite must be fully written out and ready to read aloud.>"[m
+[32m+[m[32m  "improved_text": "<The ORIGINAL transcript with ONLY these changes: remove filler words (um, uh, like, you know, basically, actually, so) and back-to-back repeated words, and fix punctuation and capitalization. STRICT RULES: do NOT add, replace, or reorder any words. Do NOT add headings, lists, or new sentences. Do NOT improve vocabulary. If something is unclear, keep it exactly as spoken. Output length must be about the same as the original minus the fillers.>"[m
+ }}[m
+ [m
+ Original Speech Transcript to Analyze:[m
+[36m@@ -775,6 +790,12 @@[m [mJSON Schema:[m
+             if module_type == 'document' and 'document_name' not in analysis_json:[m
+                 analysis_json['document_name'] = context_metrics.get("filename", "presentation.pdf")[m
+ [m
+[32m+[m[32m            if module_type == 'speech':[m
+[32m+[m[32m                orig_words = len(text.split())[m
+[32m+[m[32m                new_words = len(str(analysis_json.get('improved_text', '')).split())[m
+[32m+[m[32m                if new_words > orig_words * 1.1 or new_words < orig_words * 0.5:[m
+[32m+[m[32m                    analysis_json['improved_text'] = _local_clean_transcript(text)[m
+[32m+[m
+             # ===== ATTACH GRAMMAR DATA TO ALL MODULE RESPONSES =====[m
+             # grammar_score and grammar_issues are always attached so the[m
+             # frontend can show a grammar breakdown for every analysis type.[m
+[1mdiff --git a/frontend/src/pages/Doc

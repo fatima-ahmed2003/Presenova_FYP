@@ -46,6 +46,37 @@ TONE_INSTRUCTIONS = {
 DEFAULT_TONE = "professional"
 
 
+# ── Small helpers ────────────────────────────────────────────────────────────
+
+def _para_text(p) -> str:
+    """Text of a paragraph that may be a dict ({'text': ...}) or a plain string."""
+    if isinstance(p, dict):
+        return str(p.get("text", ""))
+    return str(p) if p is not None else ""
+
+
+def _slide_text(slide: dict, limit: int = 700) -> str:
+    """Flatten all textbox paragraphs of a slide into one short string."""
+    parts = []
+    for tb in slide.get("textboxes", []) or []:
+        for p in tb.get("paragraphs", []) or []:
+            text = _para_text(p).strip()
+            if text:
+                parts.append(text)
+    return " / ".join(parts)[:limit]
+
+
+def _slides_digest(slides: list[dict], limit: int = 700) -> str:
+    """Readable per-slide text digest used by scoring / validation prompts."""
+    lines = []
+    for s in slides:
+        lines.append(
+            f'Slide {s.get("slide_number")} | {json.dumps(s.get("title", ""), ensure_ascii=False)} | '
+            f'{json.dumps(_slide_text(s, limit), ensure_ascii=False)}'
+        )
+    return "\n".join(lines)
+
+
 # ── Build quality analysis prompt ────────────────────────────────────────────
 
 def build_quality_analysis_prompt(
@@ -86,7 +117,7 @@ Analyse the following presentation text and return a detailed quality scorecard 
 === SCORING CRITERIA ===
 Score each category from 0–100 where 100 is perfect:
 1. **Grammar** — correct grammar, no errors
-2. **Spelling** — no spelling mistakes
+2. **Spelling** — no spelling mistakes (visible typos MUST lower this score)
 3. **Readability** — clear, easy to understand; appropriate sentence length
 4. **Tone** — professional, audience-appropriate tone
 5. **Clarity** — clear and unambiguous messaging
@@ -96,42 +127,50 @@ Score each category from 0–100 where 100 is perfect:
 Also score the 7 Cs of Communication (0–100 each):
 Clear, Concise, Correct, Complete, Concrete, Coherent, Courteous
 
-=== JSON SCHEMA ===
+=== HONESTY RULES ===
+- Base EVERY score and sentence on the actual text below. Do not use generic or template wording.
+- Each "seven_cs_evaluation" sentence must point to something specific in this text.
+- "strengths" and "issues_found" must quote or name real parts of the text (typos, long sentences, missing data).
+- Do not return round placeholder numbers; scores must reflect the text.
+
+=== JSON SCHEMA (replace every <...> with real content) ===
 {{
-    "overall_score": 75,
-    "grade": "B",
-    "summary": "Brief 1-2 sentence summary of the presentation quality.",
+    "overall_score": <integer 0-100>,
+    "grade": "<A|B|C|D|F>",
+    "summary": "<1-2 sentence summary specific to this presentation>",
     "category_scores": {{
-        "Grammar": 85,
-        "Spelling": 90,
-        "Readability": 75,
-        "Tone": 80,
-        "Clarity": 70,
-        "Conciseness": 65,
-        "Structure": 72
+        "Grammar": <integer 0-100>,
+        "Spelling": <integer 0-100>,
+        "Readability": <integer 0-100>,
+        "Tone": <integer 0-100>,
+        "Clarity": <integer 0-100>,
+        "Conciseness": <integer 0-100>,
+        "Structure": <integer 0-100>
     }},
     "seven_cs_scores": {{
-        "Clear": 75,
-        "Concise": 65,
-        "Correct": 85,
-        "Complete": 70,
-        "Concrete": 60,
-        "Coherent": 72,
-        "Courteous": 80
+        "Clear": <integer 0-100>,
+        "Concise": <integer 0-100>,
+        "Correct": <integer 0-100>,
+        "Complete": <integer 0-100>,
+        "Concrete": <integer 0-100>,
+        "Coherent": <integer 0-100>,
+        "Courteous": <integer 0-100>
     }},
     "seven_cs_evaluation": {{
-        "Clear": "The message is fairly clear but could be more direct.",
-        "Concise": "Some bullet points contain unnecessary words.",
-        "Correct": "Grammar and spelling are good with minor issues.",
-        "Complete": "Covers most aspects but lacks supporting evidence.",
-        "Concrete": "More specific examples and data would strengthen claims.",
-        "Coherent": "Ideas flow logically for the most part.",
-        "Courteous": "Tone is appropriate and respectful."
+        "Clear": "<specific evaluation>",
+        "Concise": "<specific evaluation>",
+        "Correct": "<specific evaluation>",
+        "Complete": "<specific evaluation>",
+        "Concrete": "<specific evaluation>",
+        "Coherent": "<specific evaluation>",
+        "Courteous": "<specific evaluation>"
     }},
-    "strengths": ["Well-structured introduction", "Clear problem statement"],
-    "issues_found": ["Some sentences are too long", "Missing data in claims"],
-    "recommendations": ["Add specific metrics to support claims", "Break long sentences into shorter bullet points"]
+    "strengths": ["<specific strength>", "<specific strength>"],
+    "issues_found": ["<specific issue>", "<specific issue>"],
+    "recommendations": ["<actionable recommendation>", "<actionable recommendation>"]
 }}
+
+Return ONLY valid JSON. No markdown, no code fences.
 
 === FILE ===
 {filename}
@@ -153,8 +192,8 @@ def build_rewrite_prompt(
     """Build a comprehensive prompt for rewriting presentation text.
 
     Incorporates processing mode, tone, presentation context, grammar issues,
-    and pre-analysis recommendations (focus_items) the rewrite must explicitly
-    address instead of just a generic polish pass.
+    and pre-analysis recommendations (focus_items). Contains strict
+    preservation rules so the model only polishes the user's own text.
     """
     mode_system = MODE_SYSTEM_INSTRUCTIONS.get(mode, MODE_SYSTEM_INSTRUCTIONS["professional"])
     tone_instruction = TONE_INSTRUCTIONS.get(tone, TONE_INSTRUCTIONS["professional"])
@@ -167,7 +206,8 @@ def build_rewrite_prompt(
 
         for textbox in slide.get('textboxes', []):
             paragraphs = ' | '.join(
-                f'[P{p.get("para_index", i)}]: {json.dumps(str(p.get("text", "") if isinstance(p, dict) else str(p)), ensure_ascii=False)}'
+                f'[P{p.get("para_index", i) if isinstance(p, dict) else i}]: '
+                f'{json.dumps(_para_text(p), ensure_ascii=False)}'
                 for i, p in enumerate(textbox.get('paragraphs', []))
             )
             target_lines.append(
@@ -178,7 +218,7 @@ def build_rewrite_prompt(
         for table in slide.get('tables_data', []):
             for cell in table.get('cells', []):
                 paragraphs = ' | '.join(
-                    f'[P{i}]: {json.dumps(str(p.get("text", "") if isinstance(p, dict) else str(p)), ensure_ascii=False)}'
+                    f'[P{i}]: {json.dumps(_para_text(p), ensure_ascii=False)}'
                     for i, p in enumerate(cell.get('paragraphs', []))
                 )
                 target_lines.append(
@@ -189,7 +229,7 @@ def build_rewrite_prompt(
         for chart in slide.get('charts_data', []):
             if chart.get('title_paragraphs'):
                 paragraphs = ' | '.join(
-                    f'[P{i}]: {json.dumps(str(p.get("text", "") if isinstance(p, dict) else str(p)), ensure_ascii=False)}'
+                    f'[P{i}]: {json.dumps(_para_text(p), ensure_ascii=False)}'
                     for i, p in enumerate(chart.get('title_paragraphs', []))
                 )
                 target_lines.append(f'  Chart shape_index={chart.get("shape_index")} title: {paragraphs}')
@@ -204,9 +244,7 @@ def build_rewrite_prompt(
     if focus_items:
         items = '\n'.join(f'- {item}' for item in focus_items)
         focus_block = f'''
-=== MUST-ADDRESS ISSUES ===
-Pre-analysis found these specific issues. Fix every one that applies to the
-slide(s) below — don't stop at a generic polish pass:
+=== ISSUES TO ADDRESS (only where they apply, and only by editing existing wording) ===
 {items}
 '''
     context_block = ''
@@ -214,12 +252,11 @@ slide(s) below — don't stop at a generic polish pass:
     if presentation_context:
         themes = ', '.join(presentation_context.get('key_themes', [])) or 'N/A'
         context_block = f'''
-=== PRESENTATION CONTEXT ===
+=== PRESENTATION CONTEXT (background only — NEVER copy its wording into the slides) ===
 • Topic: {presentation_context.get('overall_topic', 'N/A')}
 • Objective: {presentation_context.get('main_objective', 'N/A')}
 • Type: {presentation_context.get('presentation_type', 'N/A')}
 • Level: {presentation_context.get('technical_level', 'N/A')}
-• Audience: {presentation_context.get('audience', 'N/A')}
 • Tone guidance: {presentation_context.get('tone_guidance', 'N/A')}
 • Key themes: {themes}
 '''
@@ -230,23 +267,37 @@ slide(s) below — don't stop at a generic polish pass:
 {tone_instruction}
 
 === OBJECTIVE ===
-Improve the textual content of each slide so it is concise, scannable, professional,
-and easy to explain verbally — while preserving 100% of the original meaning, facts,
-and visual structure.
+Polish the wording of each slide (spelling, grammar, clarity, concision, tone) so it is
+scannable and easy to explain verbally — while keeping 100% of the original meaning, facts
+and visual structure. You are EDITING the author's text, not writing new content.
 {context_block}
 === RULES ===
-1. Return **only valid JSON**. No markdown block, no code fences, no introductory explanations.
-2. Every slide, textbox, table cell, and chart title must appear in the output.
-3. Keep each paragraph array **exactly the same length** as the input array.
-4. **CRITICAL: NEVER USE PLACEHOLDERS LIKE "..." OR DUMMY TEXT.** Replace each input paragraph with a real, high-quality, rewritten version of that paragraph.
-5. Preserve all facts, names, dates, URLs, statistics, formulas, and technical meaning.
-6. Never add, remove, or reorder slides, shapes, textboxes, tables, charts, or cells.
-7. Make titles punchy, professional, and clear.
-8. Use parallel grammatical structure for bullet points.
-9. Eliminate weak phrases: "In this section", "As you can see", "It is important to note", etc.
+1. Return **only valid JSON**. No markdown, no code fences, no introductory explanations.
+2. Every slide and textbox listed below must appear in the output with the SAME shape_index.
+3. Keep each paragraph array **exactly the same length** as the input array (same number of paragraphs).
+4. NEVER use placeholders like "..." or dummy text. Each output paragraph is a real rewritten
+   version of the matching input paragraph.
+5. PRESERVE exactly: facts, names, dates, URLs, formulas, technical meaning, and ALL numbers and
+   percentages (copy every digit exactly; do not add, remove or change any number).
+6. NEVER ADD NEW CLAIMS. Do not introduce products, industries, metrics, benefits, safety/compliance
+   claims or domain words that are not already in that paragraph (e.g. do not add "fleet", "edge",
+   "safety", "enterprise" unless the original says so). If unsure, keep the original wording.
+7. DO NOT REWRITE branding or navigation text: footers, slide counters (e.g. "02 / 05"), lines starting
+   with "PRESENOVA AI", and lines like "Audience: ... Tone: ...". In these lines you may ONLY fix a
+   misspelled word; otherwise return them exactly unchanged. Never change the stated audience or tone.
+8. KEEP leading markers and structure: bullets, symbols, emoji, numbering ("01.", "A") and
+   "Label: description" patterns must stay as in the original.
+9. Fix misspelled words consistently everywhere (for example a misspelled topic name) — spelling only.
+10. If a paragraph is already correct and clear, return it UNCHANGED. Fewer edits are better than risky edits.
+11. Do not make a paragraph more than about 30% longer than the original.
+12. Titles: keep the meaning, make them clear and concise.
+13. Use parallel grammatical structure for bullet points of the same textbox.
+14. Remove weak phrases ("In this section", "As you can see", "It is important to note") when they appear.
+15. Never add, remove or reorder slides, shapes, textboxes, tables, charts, or cells.
+16. NEVER change a correct word into another form of it: do not split or merge compounds (e.g. "speedup" stays "speedup"), and do not switch noun/adjective forms (e.g. "Architectural" stays "Architectural"). Change a word only when it is a genuine spelling or grammar error.
 
-=== JSON SCHEMA EXAMPLE (do NOT copy literal '...', write actual rewritten text) ===
-{{"slides":[{{"slide_number":1,"textboxes":[{{"shape_index":0,"paragraphs":["High-Impact Rewritten Headline","Concise Bullet Point 1","Data-Driven Result 2"]}}]}}]}}
+=== JSON SCHEMA EXAMPLE (do NOT copy literal text, write the actual rewritten paragraphs) ===
+{{"slides":[{{"slide_number":1,"textboxes":[{{"shape_index":0,"paragraphs":["<rewritten paragraph 1>","<rewritten paragraph 2>"]}}]}}]}}
 {grammar}{focus_block}
 === SLIDE DATA ===
 {chr(10).join(slide_blocks)}
@@ -265,7 +316,7 @@ def build_presentation_context_prompt(slides: list[dict]) -> str:
     for slide in slides:
         title = slide.get('title', '')
         full_text = ' '.join(
-            str(p.get('text', '') if isinstance(p, dict) else str(p))
+            _para_text(p)
             for tb in slide.get('textboxes', [])
             for p in tb.get('paragraphs', [])
         )[:300]
@@ -281,14 +332,16 @@ Determine:
 - main_objective — what the presenter wants to achieve
 - presentation_type — e.g. thesis defense, sales pitch, training
 - technical_level — beginner | intermediate | advanced | academic
-- audience — likely viewer demographic
+- audience — the audience ONLY if the slides state it; otherwise "not stated"
 - story_flow — 1-sentence narrative arc
 - key_themes — 3-5 recurring themes
 - tone_guidance — 1 sentence on appropriate rewrite tone
 - slide_roles — mapping of slide_number → role label
 
 JSON SCHEMA:
-{{"overall_topic":"...","main_objective":"...","presentation_type":"...","technical_level":"...","audience":"...","story_flow":"...","key_themes":["..."],"tone_guidance":"...","slide_roles":{{"1":"Title Slide"}}}}
+{{"overall_topic":"<text>","main_objective":"<text>","presentation_type":"<text>","technical_level":"<text>","audience":"<text>","story_flow":"<text>","key_themes":["<text>"],"tone_guidance":"<text>","slide_roles":{{"1":"<role>"}}}}
+
+Return ONLY valid JSON.
 
 PRESENTATION DATA:
 {chr(10).join(slide_summaries)}
@@ -303,29 +356,24 @@ def build_validation_prompt(
 ) -> str:
     """Build a prompt for validating rewritten slides against originals.
 
-    Checks for semantic drift, hallucination, and structural issues.
+    Compares the actual text (not just counts) to detect semantic drift,
+    invented claims, changed numbers, changed audience and altered footers.
     """
     return f'''Compare the original and rewritten slides below. Verify that:
-1. All facts, numbers, names, and data are preserved.
-2. No hallucinated information has been added.
-3. The meaning and intent of each slide is unchanged.
-4. All slides, textboxes, and paragraphs are accounted for.
+1. All facts, numbers, percentages, names and dates are preserved exactly.
+2. No new claims, products, industries or hallucinated information were added.
+3. The meaning and intent of each slide is unchanged (including the stated audience and tone).
+4. Footers, slide counters and brand lines were not rewritten (spelling fixes only).
+5. All slides, textboxes, and paragraphs are accounted for.
 
-Return JSON: {{"valid":true,"issues":[],"slide_issues":[{{"slide_number":1,"issue":"...","severity":"minor|major"}}]}}
+Return JSON: {{"valid":<true|false>,"issues":["<issue>"],"slide_issues":[{{"slide_number":<int>,"issue":"<text>","severity":"minor|major"}}]}}
+If everything is fine return {{"valid":true,"issues":[],"slide_issues":[]}}.
 
-ORIGINAL:
-{json.dumps([{
-    "slide_number": s.get("slide_number"),
-    "title": s.get("title"),
-    "text_count": sum(len(tb.get("paragraphs", [])) for tb in s.get("textboxes", [])),
-} for s in original_slides], indent=2)}
+ORIGINAL (slide | title | text):
+{_slides_digest(original_slides)}
 
-REWRITTEN:
-{json.dumps([{
-    "slide_number": s.get("slide_number"),
-    "title": s.get("title"),
-    "text_count": sum(len(tb.get("paragraphs", [])) for tb in s.get("textboxes", [])),
-} for s in rewritten_slides], indent=2)}
+REWRITTEN (slide | title | text):
+{_slides_digest(rewritten_slides)}
 '''
 
 
@@ -338,30 +386,40 @@ def build_scoring_prompt(
 ) -> str:
     """Build a prompt for post-rewrite scoring and quality assessment.
 
-    Returns scores for original, improved, delta, and confidence.
+    The prompt includes the actual slide text of both versions so scores are
+    grounded in content (not just titles).
     """
     analysis_block = ''
     if analysis_results:
         analysis_block = f'\nPre-rewrite analysis:\n{json.dumps(analysis_results, indent=2)}\n'
 
-    return f'''You are a Presentation Quality Assessor. Evaluate the original vs improved presentation text.
+    return f'''You are a Presentation Quality Assessor. Evaluate the ORIGINAL vs IMPROVED presentation text.
 
-Score each category 0-100 for both original and improved. Compute the delta.
-Also provide a confidence score (0-100) for each category reflecting how confident
-you are that the text was actually improved.
+Score each category 0-100 for both original and improved, and compute the delta (improved minus original).
+Also give a confidence score (0-100) per category reflecting how sure you are the text really changed for the better.
+
+RULES:
+- Judge only the text shown below. Do not assume improvements that are not visible.
+- If a category's text is identical in both versions, its delta MUST be 0.
+- Do not inflate the improved score; if the rewrite added unsupported claims or changed facts, lower the score.
 
 Categories: Grammar, Spelling, Readability, Tone, Clarity, Conciseness, Structure
-
 Also score the 7 Cs: Clear, Concise, Correct, Complete, Concrete, Coherent, Courteous{analysis_block}
 
-JSON SCHEMA:
-{{"original_scores":{{"Grammar":80,...}},"improved_scores":{{"Grammar":90,...}},"delta":{{"Grammar":10,...}},"confidence":{{"Grammar":85,...}},"overall_original":80,"overall_improved":90,"grade":"A"}}
+JSON SCHEMA (replace every <...>):
+{{"original_scores":{{"Grammar":<int>,"Spelling":<int>,"Readability":<int>,"Tone":<int>,"Clarity":<int>,"Conciseness":<int>,"Structure":<int>}},
+"improved_scores":{{"Grammar":<int>,"Spelling":<int>,"Readability":<int>,"Tone":<int>,"Clarity":<int>,"Conciseness":<int>,"Structure":<int>}},
+"delta":{{"Grammar":<int>,"Spelling":<int>,"Readability":<int>,"Tone":<int>,"Clarity":<int>,"Conciseness":<int>,"Structure":<int>}},
+"confidence":{{"Grammar":<int>,"Spelling":<int>,"Readability":<int>,"Tone":<int>,"Clarity":<int>,"Conciseness":<int>,"Structure":<int>}},
+"overall_original":<int>,"overall_improved":<int>,"grade":"<A|B|C|D|F>"}}
 
-ORIGINAL slides:
-{json.dumps([{"slide_number": s.get("slide_number"), "title": s.get("title")} for s in original_slides])}
+Return ONLY valid JSON.
 
-IMPROVED slides:
-{json.dumps([{"slide_number": s.get("slide_number"), "title": s.get("title")} for s in rewritten_slides])}
+ORIGINAL slides (slide | title | text):
+{_slides_digest(original_slides)}
+
+IMPROVED slides (slide | title | text):
+{_slides_digest(rewritten_slides)}
 '''
 
 
@@ -372,7 +430,7 @@ def build_narrative_analysis_prompt(slides: list[dict]) -> str:
     slide_texts = []
     for slide in slides:
         text = ' '.join(
-            str(p.get('text', '') if isinstance(p, dict) else str(p))
+            _para_text(p)
             for tb in slide.get('textboxes', [])
             for p in tb.get('paragraphs', [])
         )
@@ -388,8 +446,12 @@ Evaluate:
 - Conclusion impact (does the ending satisfy?)
 - Missing sections (hook? problem? solution? evidence? conclusion? CTA?)
 
+Base all scores on the slides below; do not use generic numbers.
+
 Return JSON:
-{{"hook_score":80,"narrative_score":75,"pacing_score":70,"conclusion_score":85,"transitions_score":72,"overall_storytelling_score":76,"weakest_transition":"Slide 3 to 4","strongest_transition":"Slide 1 to 2","missing_sections":[],"suggested_order":[],"feedback":"..."}}
+{{"hook_score":<int>,"narrative_score":<int>,"pacing_score":<int>,"conclusion_score":<int>,"transitions_score":<int>,"overall_storytelling_score":<int>,"weakest_transition":"<text>","strongest_transition":"<text>","missing_sections":["<text>"],"suggested_order":[<slide numbers>],"feedback":"<text>"}}
+
+Return ONLY valid JSON.
 
 PRESENTATION:
 {chr(10).join(slide_texts)}
@@ -507,4 +569,3 @@ __all__ = [
     "MODE_SYSTEM_INSTRUCTIONS",
     "TONE_INSTRUCTIONS",
 ]
-

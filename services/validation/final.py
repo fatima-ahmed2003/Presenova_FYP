@@ -7,6 +7,21 @@ After all slides are rewritten and validated, this module:
 - Assigns change severity labels
 - Generates the final presentation score (0-100) with letter grade
 - Produces overall presentation assessment
+
+Honesty change in this version:
+- _heuristic_scores() previously returned HARDCODED before/after numbers
+  (e.g. Grammar 75 -> 88, Spelling 80 -> 92) every single time the AI
+  scoring call was unavailable or failed — regardless of whether the
+  rewrite actually changed anything. This produced a fake, constant
+  "improvement" (Grade D -> 69/100 style jumps) even when only a typo
+  or two were fixed. The heuristic now derives its delta from the REAL
+  per-textbox change ratio computed by _compute_change_metrics (passed
+  in as `change_metrics`), so a mostly-unchanged deck shows a small/zero
+  delta and a heavily-rewritten deck shows a larger one.
+- `compute_final_assessment()` now also records 'scoring_method'
+  ('ai' or 'heuristic_fallback') and, when falling back, the provider's
+  real failure reason (via last_structured_error, same mechanism as
+  gemini_provider.py / per_slide.py) so this is no longer a silent switch.
 """
 
 import logging
@@ -26,6 +41,20 @@ GRADE_BOUNDARIES = [
     (65, 'C+'), (60, 'C'), (55, 'C-'),
     (50, 'D+'), (45, 'D'), (40, 'D-'),
 ]
+
+# Base starting point for heuristic scores (used only when AI scoring is
+# unavailable/fails). These represent a "typical, unreviewed" deck.
+_HEURISTIC_BASE_SCORES = {
+    'Grammar': 75, 'Spelling': 80, 'Readability': 72,
+    'Tone': 75, 'Clarity': 70, 'Conciseness': 65, 'Structure': 70,
+}
+_HEURISTIC_BASE_SEVEN_CS = {
+    'Clear': 72, 'Concise': 65, 'Correct': 78,
+    'Complete': 65, 'Concrete': 60, 'Coherent': 70, 'Courteous': 78,
+}
+# Max possible delta per category when change_intensity is 100% (a near-total
+# rewrite). Scaled down linearly for lower change_intensity.
+_HEURISTIC_MAX_DELTA = 15
 
 
 class FinalValidator:
@@ -56,19 +85,20 @@ class FinalValidator:
         Returns:
             Dict with overall scores, grades, confidence, and detailed metrics.
         """
-        # 1. Compute before/after scores
-        scores = self._compute_scores(
-            original_slides, rewritten_slides, analysis_results
-        )
-
-        # 2. Calculate confidence scores
-        confidence = self._compute_confidence(
-            scores, semantic_results, structural_results
-        )
-
-        # 3. Compute change metrics
+        # 1. Compute change metrics FIRST — the heuristic scorer needs the
+        #    real change ratio to avoid returning fabricated deltas.
         changes = self._compute_change_metrics(
             original_slides, rewritten_slides
+        )
+
+        # 2. Compute before/after scores
+        scores, scoring_method, scoring_error = self._compute_scores(
+            original_slides, rewritten_slides, analysis_results, changes
+        )
+
+        # 3. Calculate confidence scores
+        confidence = self._compute_confidence(
+            scores, semantic_results, structural_results
         )
 
         # 4. Determine final grade
@@ -118,7 +148,10 @@ class FinalValidator:
             'semantic_score': semantic_results.get('preservation_score', 100) if semantic_results else 100,
             'structural_score': structural_results.get('structural_score', 100) if structural_results else 100,
             'statistics': statistics or {},
+            'scoring_method': scoring_method,
         }
+        if scoring_error:
+            assessment['scoring_error'] = scoring_error
 
         return assessment
 
@@ -127,10 +160,18 @@ class FinalValidator:
         original_slides: list[dict],
         rewritten_slides: list[dict],
         analysis_results: Optional[dict] = None,
-    ) -> dict:
+        change_metrics: Optional[dict] = None,
+    ) -> tuple[dict, str, Optional[dict]]:
         """Compute scores for original and improved content.
 
         Uses AI-powered scoring when available, heuristic otherwise.
+
+        Returns:
+            (scores, scoring_method, scoring_error) where scoring_method is
+            'ai' or 'heuristic_fallback', and scoring_error is the real
+            failure reason (from the provider) when the fallback was used
+            because of a failure rather than because no provider is
+            configured at all.
         """
         if self.provider and self.provider.is_available():
             try:
@@ -143,19 +184,45 @@ class FinalValidator:
                     max_output_tokens=4096,
                 )
                 if isinstance(result, dict) and 'overall_original' in result:
-                    return self._normalize_scores(result)
+                    return self._normalize_scores(result, change_metrics), 'ai', None
+
+                # Provider returned something, but not usable scoring data.
+                error_info = getattr(self.provider, 'last_structured_error', None)
+                if not isinstance(error_info, dict):
+                    error_info = {'type': 'empty_json', 'detail': 'AI scoring result missing overall_original.'}
+                logger.warning(
+                    "[final] AI scoring result unusable (%s): %s — using heuristic fallback.",
+                    error_info.get('type'), error_info.get('detail'),
+                )
+                return self._heuristic_scores(original_slides, rewritten_slides, change_metrics), 'heuristic_fallback', error_info
             except Exception as exc:
                 logger.warning("[final] AI scoring failed: %s", exc)
+                return (
+                    self._heuristic_scores(original_slides, rewritten_slides, change_metrics),
+                    'heuristic_fallback',
+                    {'type': 'provider_error', 'detail': str(exc)[:300]},
+                )
 
-        return self._heuristic_scores(original_slides, rewritten_slides)
+        return (
+            self._heuristic_scores(original_slides, rewritten_slides, change_metrics),
+            'heuristic_fallback',
+            {'type': 'provider_unavailable', 'detail': 'Gemini not configured (no API key, or FORCE_OFFLINE_MODE).'},
+        )
 
     def _heuristic_scores(
         self,
         original_slides: list[dict],
         rewritten_slides: list[dict],
+        change_metrics: Optional[dict] = None,
     ) -> dict:
-        """Compute heuristic scores when AI is unavailable."""
-        # Compare text lengths as a proxy for conciseness improvement
+        """Compute heuristic scores when AI is unavailable.
+
+        The delta applied to every category is now scaled by the REAL
+        change_intensity from _compute_change_metrics (0-100), instead of a
+        fixed +10 to +15 that used to appear on every single run regardless
+        of what actually changed.
+        """
+        # Compare text lengths as a secondary signal for conciseness.
         orig_total = 0
         rew_total = 0
         for orig, rew in zip(original_slides, rewritten_slides):
@@ -164,34 +231,35 @@ class FinalValidator:
             orig_total += len(orig_text)
             rew_total += len(rew_text)
 
-        # Conciseness: shorter is usually better (but not too short)
-        conciseness_improvement = 0
+        conciseness_bonus = 0
         if orig_total > 0:
             ratio = rew_total / orig_total
             if 0.7 <= ratio <= 0.9:
-                conciseness_improvement = 10  # Good improvement
+                conciseness_bonus = 3
             elif 0.5 <= ratio < 0.7:
-                conciseness_improvement = 15  # Excellent
-            elif ratio > 1.0:
-                conciseness_improvement = -5  # Got longer
+                conciseness_bonus = 5
+            elif ratio > 1.05:
+                conciseness_bonus = -3
 
-        # Default scores with heuristic adjustments
-        original_scores = {
-            'Grammar': 75, 'Spelling': 80, 'Readability': 72,
-            'Tone': 75, 'Clarity': 70, 'Conciseness': 65, 'Structure': 70,
-        }
-        improved_scores = {
-            'Grammar': 88, 'Spelling': 92, 'Readability': 82,
-            'Tone': 85, 'Clarity': 82, 'Conciseness': 75 + conciseness_improvement,
-            'Structure': 82,
-        }
+        # Real change intensity (0-100) from actual per-textbox diffing.
+        # No change_metrics available (e.g. called with empty slide lists
+        # for default-filling) -> treat as zero change.
+        change_intensity = 0.0
+        if change_metrics:
+            change_intensity = change_metrics.get('change_intensity', 0.0)
 
-        # Clamp scores
-        for k in improved_scores:
-            improved_scores[k] = max(0, min(100, improved_scores[k]))
-            original_scores[k] = max(0, min(100, original_scores[k]))
+        # Scale the max delta linearly by how much REALLY changed.
+        scale = max(0.0, min(1.0, change_intensity / 100.0))
+        base_delta = round(_HEURISTIC_MAX_DELTA * scale)
 
-        # Deltas
+        original_scores = dict(_HEURISTIC_BASE_SCORES)
+        improved_scores = {}
+        for k, base in original_scores.items():
+            delta = base_delta
+            if k == 'Conciseness':
+                delta += conciseness_bonus
+            improved_scores[k] = max(0, min(100, base + delta))
+
         deltas = {
             k: improved_scores[k] - original_scores[k]
             for k in improved_scores
@@ -200,24 +268,19 @@ class FinalValidator:
         overall_original = round(sum(original_scores.values()) / len(original_scores))
         overall_improved = round(sum(improved_scores.values()) / len(improved_scores))
 
+        original_seven_cs = dict(_HEURISTIC_BASE_SEVEN_CS)
+        improved_seven_cs = {k: max(0, min(100, v + base_delta)) for k, v in original_seven_cs.items()}
+        seven_cs_delta = {k: improved_seven_cs[k] - original_seven_cs[k] for k in improved_seven_cs}
+
         return {
             'overall_original': overall_original,
             'overall_improved': overall_improved,
             'original_category_scores': original_scores,
             'category_scores': improved_scores,
             'delta_scores': deltas,
-            'seven_cs_scores': {
-                'Clear': 82, 'Concise': 78, 'Correct': 88,
-                'Complete': 75, 'Concrete': 72, 'Coherent': 80, 'Courteous': 85,
-            },
-            'original_seven_cs_scores': {
-                'Clear': 72, 'Concise': 65, 'Correct': 78,
-                'Complete': 65, 'Concrete': 60, 'Coherent': 70, 'Courteous': 78,
-            },
-            'seven_cs_delta': {
-                'Clear': 10, 'Concise': 13, 'Correct': 10,
-                'Complete': 10, 'Concrete': 12, 'Coherent': 10, 'Courteous': 7,
-            },
+            'seven_cs_scores': improved_seven_cs,
+            'original_seven_cs_scores': original_seven_cs,
+            'seven_cs_delta': seven_cs_delta,
         }
 
     def _compute_confidence(
@@ -320,9 +383,9 @@ class FinalValidator:
                 parts.append(text)
         return ' '.join(parts)
 
-    def _normalize_scores(self, result: dict) -> dict:
+    def _normalize_scores(self, result: dict, change_metrics: Optional[dict] = None) -> dict:
         """Normalize AI scoring result with defaults."""
-        defaults = self._heuristic_scores([], [])
+        defaults = self._heuristic_scores([], [], change_metrics)
         defaults.update(result)
         return defaults
 
@@ -332,4 +395,3 @@ class FinalValidator:
             if score >= threshold:
                 return grade
         return 'F'
-

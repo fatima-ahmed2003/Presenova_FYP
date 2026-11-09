@@ -31,6 +31,8 @@ from flask_socketio import SocketIO
 from datetime import timedelta
 import os
 from dotenv import load_dotenv
+from services.ai.throttle import install_gemini_throttle
+install_gemini_throttle()
 
 # Load environment variables from absolute project root
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))

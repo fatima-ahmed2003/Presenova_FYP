@@ -1,0 +1,300 @@
+﻿    right_eye_width = max(1.0, abs(right_eye_outer[0] - right_eye_inner[0]))
+    left_eye_height = max(1.0, abs(left_eye_bottom[1] - left_eye_top[1]))
+    right_eye_height = max(1.0, abs(right_eye_bottom[1] - right_eye_top[1]))
+
+    # Eye Aspect Ratio (EAR) - detect closed eyes or looking straight down
+    left_ear = left_eye_height / left_eye_width
+    right_ear = right_eye_height / right_eye_width
+    avg_ear = (left_ear + right_ear) / 2.0
+
+    left_iris = [point(i) for i in range(468, 473)]
+    right_iris = [point(i) for i in range(473, 478)]
+    left_iris_x = sum(p[0] for p in left_iris) / len(left_iris)
+    right_iris_x = sum(p[0] for p in right_iris) / len(right_iris)
+    left_iris_y = sum(p[1] for p in left_iris) / len(left_iris)
+    right_iris_y = sum(p[1] for p in right_iris) / len(right_iris)
+
+    # Horizontal iris ratio (0.50 = perfectly centered)
+    left_h_ratio = (left_iris_x - min(left_eye_outer[0], left_eye_inner[0])) / left_eye_width
+    right_h_ratio = (right_iris_x - min(right_eye_inner[0], right_eye_outer[0])) / right_eye_width
+    gaze_h_dev = (abs(left_h_ratio - 0.50) + abs(right_h_ratio - 0.50)) / 2.0
+
+    # Vertical iris ratio (0.42 = looking directly at camera lens; >0.56 = looking down at screen/notes)
+    left_v_ratio = (left_iris_y - min(left_eye_top[1], left_eye_bottom[1])) / left_eye_height
+    right_v_ratio = (right_iris_y - min(right_eye_top[1], right_eye_bottom[1])) / right_eye_height
+    gaze_v_dev = (abs(left_v_ratio - 0.42) + abs(right_v_ratio - 0.42)) / 2.0
+
+    # Head orientation / turn deviation (Nose 1, Chin 152)
+    eye_center_x = (left_eye_outer[0] + right_eye_outer[0]) / 2.0
+    eye_center_y = (left_eye_outer[1] + right_eye_outer[1]) / 2.0
+    eye_span = max(1.0, abs(right_eye_outer[0] - left_eye_outer[0]))
+    face_len = max(1.0, abs(point(152)[1] - point(1)[1]))
+
+    head_yaw_dev = abs(point(1)[0] - eye_center_x) / eye_span
+    head_pitch_dev = abs((point(1)[1] - eye_center_y) / face_len - 0.55)
+
+    # FIX: The previous version used a binary "is_looking_away" gate that snapped
+    # eye_contact_score straight to 0 the instant ANY one of six tight thresholds
+    # (e.g. vertical iris ratio > 0.56) was crossed. On a typical laptop webcam
+    # â€” mounted above the screen, a few inches from the content the user is
+    # actually reading â€” normal screen-viewing gaze routinely exceeds those
+    # thresholds even while genuinely paying attention, so the score pinned to
+    # 0% almost permanently. Only fully closed eyes are a hard 0 now; gaze and
+    # head-angle deviation instead degrade the score continuously (same
+    # weighted-penalty style as the posture score below), with a wider
+    # tolerance band before penalties kick in.
+    eyes_closed = avg_ear < 0.16
+
+    if eyes_closed:
+        eye_contact_score = 0
+    else:
+        total_dev = (gaze_h_dev * 1.8) + (gaze_v_dev * 2.0) + (head_yaw_dev * 1.5) + (head_pitch_dev * 1.5)
+        eye_contact_score = _clip_score(100 - (total_dev * 110), 0, 100)
+        if total_dev > 0.55:
+            eye_contact_score = max(0, eye_contact_score - 20)
+
+    ideal_cx = w / 2
+    ideal_cy = h * 0.42
+    dev_x = abs(face_cx - ideal_cx) / w
+    dev_y = abs(face_cy - ideal_cy) / h
+
+    eye_dx = right_eye_outer[0] - left_eye_outer[0]
+    eye_dy = right_eye_outer[1] - left_eye_outer[1]
+    eye_tilt = abs(eye_dy) / max(1.0, abs(eye_dx))
+
+    size_penalty = 0
+    if face_height_ratio < 0.24:
+        size_penalty = (0.24 - face_height_ratio) * 130
+    elif face_height_ratio > 0.72:
+        size_penalty = (face_height_ratio - 0.72) * 100
+
+    posture_score = _clip_score(
+        100 - (dev_x * 130) - (dev_y * 115) - (eye_tilt * 180) - size_penalty,
+        0,
+        100
+    )
+
+    if posture_score < 70:
+        if dev_x > 0.15:
+            hint = "Center yourself in front of the camera."
+        elif face_height_ratio < 0.24:
+            hint = "Move closer so your face is clearly visible."
+        elif eye_tilt > 0.12:
+            hint = "Keep your head level and shoulders steady."
+        else:
+            hint = "Sit upright and keep a steady posture."
+    elif eye_contact_score < 70:
+        if gaze_v_dev > 0.15:
+            hint = "Look up at the camera lens instead of down at your notes."
+        else:
+            hint = "Look closer to the camera lens for stronger eye contact."
+    else:
+        hint = "Good eye contact and posture!"
+
+    return _visual_result(
+        eye_contact_score,
+        posture_score,
+        hint,
+        session=session,
+        face_detected=True,
+        visibility_score=face_visibility
+    )
+
+
+def _analyze_frame_with_haar(img, session=None):
+    if not _cascades_initialized:
+        init_cascades()
+
+    if face_cascade is None and face_cascade_alt2 is None:
+        return None
+
+    h, w, _ = img.shape
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    with _vision_lock:
+        global _CLAHE
+        if _CLAHE is None and OPENCV_AVAILABLE:
+            _CLAHE = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        enhanced_gray = _CLAHE.apply(gray) if _CLAHE is not None else gray
+
+        def _safe_detect(cascade, im, sf=1.15, mn=3, ms=(30, 30)):
+            if cascade is None or im is None:
+                return []
+            try:
+                res = cascade.detectMultiScale(im, scaleFactor=max(1.10, sf), minNeighbors=mn, minSize=ms)
+                return list(res) if len(res) > 0 else []
+            except Exception:
+                return []
+
+        faces = _safe_detect(face_cascade_alt2, enhanced_gray, sf=1.15, mn=3, ms=(30, 30))
+
+        if len(faces) == 0:
+            faces = _safe_detect(face_cascade, enhanced_gray, sf=1.15, mn=3, ms=(30, 30))
+
+        if len(faces) == 0:
+            faces = _safe_detect(face_cascade_alt2, gray, sf=1.15, mn=3, ms=(30, 30))
+
+        if len(faces) == 0:
+            faces = _safe_detect(profile_cascade, enhanced_gray, sf=1.18, mn=3, ms=(30, 30))
+
+        if len(faces) == 0:
+            eq_gray = cv2.equalizeHist(gray)
+            faces = _safe_detect(face_cascade_alt2, eq_gray, sf=1.15, mn=2, ms=(25, 25))
+            if len(faces) == 0:
+                faces = _safe_detect(face_cascade, eq_gray, sf=1.15, mn=2, ms=(25, 25))
+
+        if len(faces) == 0:
+            return _unmeasured_visual_result("Face not detected. Ensure adequate lighting and look at the camera.")
+
+        fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+        face_cx = fx + fw / 2
+        face_cy = fy + fh / 2
+        ideal_cx = w / 2
+        ideal_cy = h * 0.35
+
+        dev_x = abs(face_cx - ideal_cx) / w
+        dev_y = (face_cy - ideal_cy) / h
+        face_height_ratio = fh / h
+
+        x_penalty = min(30, dev_x * 120)
+        y_penalty = min(40, dev_y * 133) if dev_y > 0 else min(15, abs(dev_y) * 75)
+        size_penalty = 0
+        if face_height_ratio < 0.2:
+            size_penalty = min(20, (0.2 - face_height_ratio) * 100)
+        elif face_height_ratio > 0.65:
+            size_penalty = min(15, (face_height_ratio - 0.65) * 80)
+
+        posture_score = _clip_score(100 - x_penalty - y_penalty - size_penalty, 0, 100)
+
+        face_roi_enhanced = enhanced_gray[fy:fy + fh, fx:fx + fw]
+        face_roi_gray = gray[fy:fy + fh, fx:fx + fw]
+        eyes = _safe_detect(eye_cascade, face_roi_enhanced, sf=1.12, mn=3, ms=(10, 10))
+        if len(eyes) == 0:
+            eyes = _safe_detect(eye_cascade, face_roi_gray, sf=1.12, mn=2, ms=(10, 10))
+
+    face_visibility = max(0.0, min(1.0, (fw * fh) / (w * h)))
+
+    if len(eyes) == 0:
+        # Face is clearly present! Position/posture is solid.
+        # Estimate eye contact based on head centering rather than dropping to 0.
+        centered_bonus = max(0, int(35 - dev_x * 100))
+        eye_contact_score = int(_clip_score(45 + centered_bonus, 30, 80))
+        hint = "Face detected. Look directly at the camera lens for optimal eye contact." if posture_score >= 70 else "Sit upright and look at the camera."
+        return _visual_result(
+            eye_contact_score,
+            posture_score,
+            hint,
+            emotion="Focused" if posture_score >= 70 else "Nervous",
+            session=session,
+            face_detected=True,
+            visibility_score=face_visibility
+        )
+
+    face_area = fw * fh
+    eye_metrics = []
+    for (ex, ey, ew, eh) in eyes:
+        eye_cx = ex + (ew / 2)
+        eye_cy = ey + (eh / 2)
+        area_ratio = (ew * eh) / face_area
+        visibility_score = max(0.0, min(1.0, (area_ratio - 0.01) / 0.04))
+        horizontal_offset = abs(eye_cx - (fw * 0.5)) / fw
+        vertical_offset = abs(eye_cy - (fh * 0.45)) / fh
+
+        # Pupil dark center detection inside eye ROI
+        gaze_dev_roi = 0.0
+        try:
+            eye_crop = face_roi_gray[ey:ey + eh, ex:ex + ew]
+            if eye_crop.size > 0:
+                blurred = cv2.GaussianBlur(eye_crop, (5, 5), 0)
+                _, _, min_loc, _ = cv2.minMaxLoc(blurred)
+                pupil_x, pupil_y = min_loc
+                pupil_h_ratio = pupil_x / float(max(1, ew))
+                pupil_v_ratio = pupil_y / float(max(1, eh))
+                gaze_dev_roi = abs(pupil_h_ratio - 0.50) + abs(pupil_v_ratio - 0.40)
+        except Exception:
+            gaze_dev_roi = 0.15
+
+        eye_metrics.append({
+            "cx": eye_cx,
+            "cy": eye_cy,
+            "w": ew,
+            "h": eh,
+            "visibility": visibility_score,
+            "horizontal_offset": min(1.0, horizontal_offset * 2),
+            "vertical_offset": min(1.0, vertical_offset * 3),
+            "gaze_dev": gaze_dev_roi
+        })
+
+    avg_gaze_dev = sum(e["gaze_dev"] for e in eye_metrics) / len(eye_metrics)
+    avg_center_offset = sum(e["horizontal_offset"] for e in eye_metrics) / len(eye_metrics)
+
+    if len(eye_metrics) == 1:
+        # Single eye detected (slight head turn or shadow)
+        dev_penalty = min(50, avg_gaze_dev * 200 + avg_center_offset * 30)
+        eye_contact_score = int(_clip_score(70 - dev_penalty, 25, 80))
+    elif avg_gaze_dev > 0.18 or avg_center_offset > 0.22:
+        # User is looking significantly away from camera
+        eye_contact_score = 20
+    else:
+        gaze_penalty = min(70, avg_gaze_dev * 180)
+        left_eye, right_eye = sorted(eye_metrics[:2], key=lambda e: e["cx"])
+        avg_visibility = (left_eye["visibility"] + right_eye["visibility"]) / 2
+        vertical_alignment = 1.0 - min(1.0, abs(left_eye["cy"] - right_eye["cy"]) / max(1.0, fh * 0.08))
+        symmetry = (
+            min(left_eye["w"], right_eye["w"]) / max(1.0, max(left_eye["w"], right_eye["w"])) +
+            min(left_eye["h"], right_eye["h"]) / max(1.0, max(left_eye["h"], right_eye["h"]))
+        ) / 2
+        eye_distance_ratio = abs(right_eye["cx"] - left_eye["cx"]) / max(1.0, fw)
+        expected_distance = 0.28
+        distance_alignment = 1.0 - min(1.0, abs(eye_distance_ratio - expected_distance) / expected_distance)
+
+        base_raw_score = 100 * (
+            0.35 * avg_visibility +
+            0.25 * (1.0 - avg_center_offset) +
+            0.20 * vertical_alignment +
+            0.10 * symmetry +
+            0.10 * distance_alignment
+        )
+        eye_contact_score = int(_clip_score(base_raw_score - gaze_penalty, 30, 100))
+
+    if posture_score < 70:
+        if dev_y > 0.15:
+            hint = "Sit upright! You are slouching."
+        elif dev_x > 0.15:
+            hint = "Center yourself in front of the camera."
+        elif face_height_ratio < 0.2:
+            hint = "Move a bit closer to the camera."
+        else:
+            hint = "Adjust your posture to sit straight."
+    elif eye_contact_score < 60:
+        hint = "Look directly into the camera lens."
+    else:
+        hint = "Good eye contact and posture!"
+
+    return _visual_result(
+        eye_contact_score,
+        posture_score,
+        hint,
+        session=session,
+        face_detected=True,
+        visibility_score=face_visibility
+    )
+
+def analyze_webcam_frame(base64_image_data: str, session=None) -> dict:
+    """
+    Analyzes a base64 encoded video frame for eye contact and posture alignment.
+    Uses MediaPipe Face Mesh when available, with OpenCV Haar Cascades as a real fallback.
+    """
+    if not base64_image_data:
+        return _unmeasured_visual_result("No video signal was received.")
+
+    try:
+        img = _decode_frame(base64_image_data)
+        if img is None:
+            reason = OPENCV_IMPORT_ERROR or "OpenCV could not decode this frame."
+            return _unmeasured_visual_result(f"Camera frame could not be processed: {reason}")
+
+        mediapipe_result = _analyze_frame_with_mediapipe(img, session)
+        if mediapipe_result is not None:
+            return mediapipe_result
+

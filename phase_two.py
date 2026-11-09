@@ -130,7 +130,10 @@ def analyze_document():
     2. Feed to Gemini 2.5 Flash for scoring, feedback, and rewrite.
     3. Save results and upload metadata to database.
     """
+    # DEBUG_TEMP: remove after caching bug is diagnosed
+    logger.info(f"[DEBUG] New analysis triggered, timestamp={datetime.now()}")
     guest_check = enforce_guest_size_limit(max_guest_bytes=10 * 1024 * 1024)
+    
     if guest_check:
         return guest_check
 

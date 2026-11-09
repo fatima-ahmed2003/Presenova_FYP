@@ -83,3 +83,5 @@ firebase-service-account.json
 
 *.exe
 !frontend/public/downloads/*.exe
+
+firebase-service-account.json

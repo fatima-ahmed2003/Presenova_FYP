@@ -1,0 +1,297 @@
+Presenova_FYP/
++---.agents
+|   \---skills
+|       \---fyp
+|           \---SKILL.md
++---.vscode
+|   \---launch.json
++---cascades
+|   +---face_detection_yunet.onnx
+|   +---face_landmarker.task
+|   +---haarcascade_eye.xml
+|   +---haarcascade_frontalface_alt2.xml
+|   +---haarcascade_frontalface_default.xml
+|   \---haarcascade_profileface.xml
++---flutter_app
+|   +---lib
+|   |   +---config
+|   |   |   \---constants.dart
+|   |   +---providers
+|   |   |   +---auth_provider.dart
+|   |   |   \---coach_provider.dart
+|   |   +---screens
+|   |   |   +---analyzer
+|   |   |   |   \---speech_analyzer_screen.dart
+|   |   |   +---auth
+|   |   |   |   +---forgot_password_screen.dart
+|   |   |   |   \---login_screen.dart
+|   |   |   +---coach
+|   |   |   |   \---live_coach_screen.dart
+|   |   |   +---dashboard
+|   |   |   |   \---dashboard_screen.dart
+|   |   |   +---home
+|   |   |   |   \---main_navigation_screen.dart
+|   |   |   \---profile
+|   |   |       \---profile_screen.dart
+|   |   +---services
+|   |   |   +---api_service.dart
+|   |   |   \---auth_service.dart
+|   |   +---widgets
+|   |   |   +---custom_button.dart
+|   |   |   +---glass_card.dart
+|   |   |   \---metric_badge.dart
+|   |   \---main.dart
+|   \---pubspec.yaml
++---frontend
+|   +---electron
+|   |   \---main.js
+|   +---public
+|   |   +---downloads
+|   |   |   +---app-release.apk
+|   |   |   +---Presenova-1.1.0.dmg
+|   |   |   \---Presenova-Setup-1.1.0.exe
+|   |   +---icons
+|   |   |   +---icon-128.png
+|   |   |   +---icon-192.png
+|   |   |   +---icon-512.png
+|   |   |   +---icon-72.png
+|   |   |   \---icon-96.png
+|   |   +---screenshots
+|   |   |   +---dashboard.png
+|   |   |   +---document-analyzer.png
+|   |   |   +---live-coach.png
+|   |   |   +---speech-analyzer.png
+|   |   |   \---viva.png
+|   |   +---_redirects
+|   |   +---logo-full.png
+|   |   +---logo-icon.png
+|   |   +---manifest.json
+|   |   \---service-worker.js
+|   +---scripts
+|   |   \---check-bundle-secrets.js
+|   +---src
+|   |   +---components
+|   |   |   +---Button.css
+|   |   |   +---Button.tsx
+|   |   |   +---ComparisonDashboard.css
+|   |   |   +---ComparisonDashboard.tsx
+|   |   |   +---ErrorBoundary.tsx
+|   |   |   +---ExportPdfButton.tsx
+|   |   |   +---FileUploader.css
+|   |   |   +---FileUploader.tsx
+|   |   |   +---Layout.css
+|   |   |   +---Layout.tsx
+|   |   |   +---LiveFeedbackOverlay.tsx
+|   |   |   +---ProtectedRoute.tsx
+|   |   |   +---ReportDashboard.css
+|   |   |   +---ReportDashboard.tsx
+|   |   |   +---SplashScreen.css
+|   |   |   +---SplashScreen.tsx
+|   |   |   \---VideoCapture.tsx
+|   |   +---context
+|   |   |   \---AuthContext.tsx
+|   |   +---hooks
+|   |   |   \---useLiveSession.ts
+|   |   +---pages
+|   |   |   +---Analytics.css
+|   |   |   +---Analytics.tsx
+|   |   |   +---Dashboard.css
+|   |   |   +---Dashboard.tsx
+|   |   |   +---DocumentAnalyzer.css
+|   |   |   +---DocumentAnalyzer.tsx
+|   |   |   +---Download.css
+|   |   |   +---Download.tsx
+|   |   |   +---Landing.css
+|   |   |   +---Landing.tsx
+|   |   |   +---LandingSections.css
+|   |   |   +---LiveCoach.css
+|   |   |   +---LiveCoach.tsx
+|   |   |   +---Login.css
+|   |   |   +---Login.tsx
+|   |   |   +---PracticeMode.css
+|   |   |   +---PracticeMode.tsx
+|   |   |   +---PresentationGenerator.css
+|   |   |   +---PresentationGenerator.tsx
+|   |   |   +---PresentationRewriter.css
+|   |   |   +---PresentationRewriter.tsx
+|   |   |   +---SpeechAnalyzer.css
+|   |   |   \---SpeechAnalyzer.tsx
+|   |   +---services
+|   |   |   +---api.ts
+|   |   |   +---firebase.ts
+|   |   |   +---geminiService.ts
+|   |   |   +---pdfGenerator.ts
+|   |   |   +---presentationGeneratorApi.ts
+|   |   |   \---presentationRewriterApi.ts
+|   |   +---types
+|   |   |   +---firebase.d.ts
+|   |   |   \---index.ts
+|   |   +---utils
+|   |   |   +---generateComparisonPdf.ts
+|   |   |   \---generatePdf.ts
+|   |   +---App.css
+|   |   +---App.tsx
+|   |   +---main.tsx
+|   |   \---vite-env.d.ts
+|   +---.env
+|   +---.env.example
+|   +---index.html
+|   +---package.json
+|   +---package-lock.json
+|   +---postcss.config.js
+|   +---README.md
+|   +---tailwind.config.js
+|   +---tsconfig.json
+|   +---tsconfig.node.json
+|   +---vercel.json
+|   \---vite.config.ts
++---instance
+|   +---generated_presentations
+|   +---image_cache
+|   +---presentation_rewriter
+|   \---presenova_store.json
++---nlp_module
+|   +---datasets
+|   |   \---asap_aes.csv
+|   +---__init__.py
+|   +---feature_extractors.py
+|   +---feedback_templates.py
+|   +---scoring_model.py
+|   +---train_model.py
+|   \---trained_weights.pkl
++---routes
+|   +---__init__.py
+|   +---presentation_generator.py
+|   +---presentation_rewriter.py
+|   \---question_generator.py
++---services
+|   +---ai
+|   |   +---__init__.py
+|   |   +---base_provider.py
+|   |   +---fallback.py
+|   |   +---gemini_provider.py
+|   |   +---prompts.py
+|   |   +---scoring_utils.py
+|   |   \---seven_cs_evaluator.py
+|   +---analysis
+|   |   +---__init__.py
+|   |   +---accessibility.py
+|   |   +---consistency.py
+|   |   +---context_verifier.py
+|   |   +---delivery.py
+|   |   +---design.py
+|   |   +---duplicate_detector.py
+|   |   +---holistic.py
+|   |   +---narrative.py
+|   |   +---pacing.py
+|   |   +---per_slide.py
+|   |   +---sentiment.py
+|   |   +---speaker.py
+|   |   +---statistics.py
+|   |   +---storytelling.py
+|   |   \---visuals.py
+|   +---report
+|   |   +---__init__.py
+|   |   +---analytics.py
+|   |   +---executive_summary.py
+|   |   \---recommendations.py
+|   +---rewrite
+|   |   +---__init__.py
+|   |   +---executor.py
+|   |   +---planner.py
+|   |   +---smart_filter.py
+|   |   \---spacy_rewriter.py
+|   +---validation
+|   |   +---__init__.py
+|   |   +---final.py
+|   |   +---semantic.py
+|   |   \---structural.py
+|   +---__init__.py
+|   +---coach_intent_engine.py
+|   +---coach_state_machine.py
+|   +---coach_templates.py
+|   +---config.py
+|   +---download_service.py
+|   +---gemini_service.py
+|   +---language_tool_service.py
+|   +---ppt_processor.py
+|   +---presentation_generator.py
+|   +---question_generator.py
+|   +---rate_limiter.py
+|   +---report_generator.py
+|   +---response.py
+|   +---rewrite_engine.py
+|   +---text_extractor.py
+|   \---viva_rag_engine.py
++---tests
+|   +---test_analyzer_sklearn.py
+|   +---test_backend_connectivity.py
+|   +---test_coach_intent.py
+|   +---test_coach_intent_classifier.py
+|   +---test_context_checker_rag.py
+|   +---test_end_to_end.py
+|   +---test_enhanced_presentation_generator.py
+|   +---test_fixed_score_fix.py
+|   +---test_forgot_password.py
+|   +---test_live_all.py
+|   +---test_live_coach_fixture.py
+|   +---test_offline_nlp.py
+|   +---test_presentation_rewriter_production.py
+|   +---test_presentation_rewriter_prompt.py
+|   +---test_professional_layouts.py
+|   +---test_rewrite.py
+|   +---test_rewriter_regressions.py
+|   +---test_rewriter_spacy.py
+|   +---test_spacy_rewriter.py
+|   \---test_viva_rag.py
++---tools
+|   +---check_env.py
+|   +---compare_pptx.py
+|   +---enhance_gamma_doc.py
+|   +---scan_errors.py
+|   \---test_verification.py
++---.env.example
++---.firebaserc
++---.gitignore
++---AGENTS.md
++---ai_evaluator.py
++---antigravity-instructions.md
++---auth.py
++---COMPLETE_PROJECT_DOCUMENTATION.md
++---COMPREHENSIVE_AUDIT_AND_FIX_ROADMAP.md
++---deploy_firebase.bat
++---firebase.json
++---FYP_DOCUMENTATION.md
++---Gamma_Feature_Analysis_Presenova.docx
++---Gamma_Feature_Analysis_Presenova.md
++---GEMINI_SETUP.md
++---generate_dataset.py
++---generate_pdf.py
++---main.py
++---models.py
++---package.json
++---package-lock.json
++---phase_five.py
++---phase_four.py
++---phase_live.py
++---PHASE_ONE_AUTH.md
++---PHASE_ONE_QUICK_REFERENCE.md
++---phase_two.py
++---PHASE_TWO_INTEGRATION.md
++---PRE_DEPLOYMENT_AUDIT_REPORT.md
++---PRESENOVA_ARCHITECTURE_VIVA_GUIDE.md
++---PRESENOVA_ARCHITECTURE_VIVA_GUIDE.pdf
++---Procfile
++---PROJECT_DOCUMENTATION.md
++---project_structure.txt
++---project_structure_clean.txt
++---pyrightconfig.json
++---README.md
++---render.yaml
++---requirements.txt
++---run.bat
++---run_project.bat
++---runtime.txt
++---SETUP.md
++---SYSTEM_ISSUES_AND_STATUS_REPORT.md
+\---train_local_model.py

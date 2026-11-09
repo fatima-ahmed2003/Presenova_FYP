@@ -45,6 +45,15 @@ else:
     logger.warning("[AI WARN] Global AI Evaluator: GEMINI_API_KEY not configured or offline. Running with smart fallbacks.")
 
 
+def _local_clean_transcript(text: str) -> str:
+    """Safety net: remove fillers and back-to-back repeats WITHOUT adding any new words."""
+    t = re.sub(r'\b(um+|uh+|erm|err)\b[,]?\s*', '', text, flags=re.I)
+    t = re.sub(r'\b(you know|basically|actually|kind of)\b[,]?\s*', '', t, flags=re.I)
+    t = re.sub(r'\b(\w+)(\s+\1\b)+', r'\1', t, flags=re.I)
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t[:1].upper() + t[1:] if t else t
+
+
 def evaluate_7cs(text: str, module_type: str, context_metrics: dict) -> dict:
     """
     Evaluates text (document slides, transcripts, or live presentation speech)
@@ -168,7 +177,9 @@ def evaluate_7cs(text: str, module_type: str, context_metrics: dict) -> dict:
         if overall_score < 60:
             dynamic_strengths = [
                 f"Document contains {word_count} words — content exists and can be refined.",
-                f"Grammar score: {computed_grammar_score}/100 ({grammar_adj}) — " + ("some positive aspects" if computed_grammar_score >= 60 else "significant room for improvement."),
+                (f"Grammar score: {computed_grammar_score}/100 — some positive aspects."
+                 if computed_grammar_score >= 60 else
+                 f"Content covers {word_count} words with identifiable structure, though grammar needs work."),
                 "Core topic intent is identifiable even in current state."
             ]
             dynamic_recs = [
@@ -195,7 +206,7 @@ def evaluate_7cs(text: str, module_type: str, context_metrics: dict) -> dict:
                 "Concrete": max(20, overall_score - 8),
                 "Consistent": max(20, overall_score - 14)
             }
-            grammar_note_text = grammar_summary_text[:200] if grammar_summary_text else 'See detailed grammar report.'
+            grammar_note_text = grammar_summary_text[:600] if grammar_summary_text else 'See detailed grammar report.'
             grammar_detail_low = (
                 'No significant grammar issues detected.'
                 if not grammar_issues
@@ -216,7 +227,9 @@ def evaluate_7cs(text: str, module_type: str, context_metrics: dict) -> dict:
         else:
             dynamic_strengths = [
                 f"Content depth is {depth_adj}: {word_count} words provide {'comprehensive' if word_count > 300 else 'adequate'} coverage.",
-                f"Grammar quality is {grammar_adj} at {computed_grammar_score}/100 (Grade {_grammar_grade(computed_grammar_score)}).",
+                (f"Grammar quality is {grammar_adj} at {computed_grammar_score}/100 (Grade {_grammar_grade(computed_grammar_score)})."
+ if computed_grammar_score >= 70 else
+ f"Content is complete at {word_count} words, though grammar needs attention."),
                 f"Sentence structure is {variety_adj} (variety score: {sentence_variety_score}/100)."
             ]
             dynamic_recs = [
@@ -243,7 +256,7 @@ def evaluate_7cs(text: str, module_type: str, context_metrics: dict) -> dict:
                 "Concrete": min(100, overall_score + 1),
                 "Consistent": min(100, overall_score + 2)
             }
-            grammar_review_text = grammar_summary_text[:150] if grammar_summary_text else 'Review the grammar report.'
+            grammar_review_text = grammar_summary_text[:600] if grammar_summary_text else 'Review the grammar report.'
             grammar_detail_high = (
                 'No grammar issues detected — excellent writing quality.'
                 if not grammar_issues
@@ -632,6 +645,8 @@ Total Grammar/Spelling Issues Detected: {len(grammar_issues)}
 You are an expert presentation coach and public speaking/communication consultant. Your job is to analyze the following speech transcript, identify all errors, grammatical mistakes, verbal pacing issues, and assess how well it adheres to the 7 Cs of Communication (Clear, Concise, Correct, Complete, Courteous, Concrete, Consistent).
 
 IMPORTANT: A grammar pre-analysis has already been performed using LanguageTool. The grammar quality score is {computed_grammar_score}/100 based on {len(grammar_issues)} detected issues. Use this data to calibrate the 'Correct' dimension accurately.{grammar_section}
+TRANSCRIPT RELIABILITY: This transcript comes from automatic speech recognition (ASR) and may contain recognition errors (wrong or odd words). Do NOT blame the speaker for words that look like ASR mistakes, and do NOT invent or assume what the speaker meant. Judge only delivery: pacing, fillers, structure, and clarity of ideas. Never introduce technical terms or product details the speaker did not say.
+
 We have also calculated the following real-time speaking metrics from the audio recording for your context:
 - Speaking pace: {speech_speed_wpm} WPM (optimal: 120-160 WPM)
 - Filler words count: {filler_count} instances (filler percentage: {filler_percentage:.1f}%)
@@ -680,7 +695,7 @@ JSON Schema:
     "<actionable recommendations/corrections 3 with specific detail>"
   ],
   "detailed_feedback": "<2-3 paragraph comprehensive analysis pointing out specific vocal flaws, grammar issues (mention grammar score {computed_grammar_score}/100), pacing problems, and recommendations>",
-  "improved_text": "<Complete, professional rewrite of the transcript. Remove all filler words (um, like, basically), repetitions, correct any grammatical errors, and format it with clear structural headings. This rewrite must be fully written out and ready to read aloud.>"
+  "improved_text": "<The ORIGINAL transcript with ONLY these changes: remove filler words (um, uh, like, you know, basically, actually, so) and back-to-back repeated words, and fix punctuation and capitalization. STRICT RULES: do NOT add, replace, or reorder any words. Do NOT add headings, lists, or new sentences. Do NOT improve vocabulary. If something is unclear, keep it exactly as spoken. Output length must be about the same as the original minus the fillers.>"
 }}
 
 Original Speech Transcript to Analyze:
@@ -774,6 +789,12 @@ JSON Schema:
             # Ensure document_name is set for document analysis
             if module_type == 'document' and 'document_name' not in analysis_json:
                 analysis_json['document_name'] = context_metrics.get("filename", "presentation.pdf")
+
+            if module_type == 'speech':
+                orig_words = len(text.split())
+                new_words = len(str(analysis_json.get('improved_text', '')).split())
+                if new_words > orig_words * 1.1 or new_words < orig_words * 0.5:
+                    analysis_json['improved_text'] = _local_clean_transcript(text)
 
             # ===== ATTACH GRAMMAR DATA TO ALL MODULE RESPONSES =====
             # grammar_score and grammar_issues are always attached so the

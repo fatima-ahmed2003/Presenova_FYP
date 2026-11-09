@@ -1,6 +1,14 @@
 /**
- * PracticeMode Page (Phase 5)
+ * PracticeMode Page (Phase 5, UI V2)
  * Real-time AI Coach chat interface for multi-turn presentation practice
+ *
+ * UI V2 changes:
+ *  - Two-column layout: chat (main) + side panel (Context, grouped Quick Prompts, collapsible About)
+ *  - Chat header bar (status, message count, Clear chat)
+ *  - AI messages render **bold** and "- " bullet lines properly
+ *  - Quick prompt click fills the input AND focuses it
+ *  - Chat logic / API call / context handling unchanged
+ *  - Old Quick Suggestions + Info sections kept below as comments (UI_V1_DISABLED). Nothing deleted.
  *
  * Features:
  * - Direct Google Gemini API connection (Gemini 2.0 Flash / 1.5 Flash) with backend fallback
@@ -9,7 +17,6 @@
  * - Real-time typing indicators during AI response generation
  * - Auto-scroll to latest messages
  * - Send message with Enter key, Shift+Enter for new lines
- * - Interactive Gemini API key configuration modal
  */
 
 import React, { useState, useRef, useEffect } from 'react';
@@ -18,6 +25,62 @@ import { useLocation } from 'react-router-dom';
 import { sendChatMessage } from '../services/api';
 import { ChatMessage, ContextReport } from '../types';
 import './PracticeMode.css';
+import './PracticeModeV2.css';
+
+// ===== Quick prompt groups (same six prompts as before, now grouped) =====
+const PROMPT_GROUPS: { title: string; items: { label: string; icon: string; prompt: string }[] }[] = [
+  {
+    title: 'Delivery',
+    items: [
+      { label: 'Reduce Filler Words', icon: '🗣️', prompt: "I often use filler words like 'um' and 'like'. How can I reduce them?" },
+      { label: 'Perfect Your Pace', icon: '⏱️', prompt: "How should I pace my slides so I don't run out of time during a 10-minute presentation?" },
+      { label: 'Manage Anxiety', icon: '🧘', prompt: 'I get nervous before speaking. What 2-minute technique can help me stay calm and confident?' },
+    ],
+  },
+  {
+    title: 'Content',
+    items: [
+      { label: 'Powerful Openings', icon: '🎯', prompt: 'How can I improve my presentation opening to hook my audience immediately?' },
+      { label: 'Slide Architecture', icon: '🧱', prompt: 'How do I structure my problem statement and solution slides for maximum persuasion?' },
+    ],
+  },
+  {
+    title: 'Defense',
+    items: [
+      { label: 'Viva Defense Pitfalls', icon: '🛡️', prompt: 'What are the most common defense mistakes students make during viva examinations?' },
+    ],
+  },
+];
+
+const ABOUT_ITEMS = [
+  { icon: '👥', title: 'Personalized Coaching', text: 'Your AI Coach adapts to your specific presentation context, analyzing your 7Cs scores and pacing telemetry.' },
+  { icon: '💡', title: 'Evidence-Based Delivery', text: 'Every recommendation follows academic presentation frameworks, rhetorical structures, and speech cadence science.' },
+  { icon: '⚡', title: 'Google Gemini Powered', text: 'Connected directly to Google Gemini 2.0 Flash for sub-second intelligence, low latency, and high reasoning fidelity.' },
+  { icon: '💬', title: 'Multi-Turn Defense Prep', text: 'Ask follow-up questions, drill tough committee inquiries, and rehearse realistic defense cross-examinations.' },
+];
+
+// ===== Tiny message renderer: **bold** and "- " bullets =====
+const renderInline = (text: string) =>
+  text.split(/(\*\*[^*]+\*\*)/g).map((part, i) =>
+    part.startsWith('**') && part.endsWith('**') && part.length > 4
+      ? <strong key={i}>{part.slice(2, -2)}</strong>
+      : <React.Fragment key={i}>{part}</React.Fragment>
+  );
+
+const renderMessage = (text: string) =>
+  text.split('\n').map((line, i) => {
+    const t = line.trimStart();
+    if (/^[-•]\s+/.test(t)) {
+      return (
+        <div key={i} className="da3-li">
+          <span className="da3-li-dot">•</span>
+          <span>{renderInline(t.replace(/^[-•]\s+/, ''))}</span>
+        </div>
+      );
+    }
+    if (!line.trim()) return <div key={i} className="da3-gap" />;
+    return <p key={i} className="da3-line">{renderInline(line)}</p>;
+  });
 
 const PracticeMode: React.FC = () => {
   const location = useLocation();
@@ -78,6 +141,7 @@ I have analyzed the progress you've made, as well as the remaining areas to poli
   const [userInput, setUserInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showAbout, setShowAbout] = useState(false);
 
   // AI Coach Status State
   const [keyNotice] = useState<string | null>(null);
@@ -85,6 +149,7 @@ I have analyzed the progress you've made, as well as the remaining areas to poli
   // ===== REFS =====
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   // ===== AUTO-SCROLL TO BOTTOM WHEN NEW MESSAGES ARRIVE =====
   useEffect(() => {
@@ -92,8 +157,6 @@ I have analyzed the progress you've made, as well as the remaining areas to poli
       messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }, 100);
   }, [messages, isLoading]);
-
-
 
   // ===== SEND MESSAGE HANDLER =====
   const handleSendMessage = async () => {
@@ -175,10 +238,24 @@ I have analyzed the progress you've made, as well as the remaining areas to poli
   // ===== QUICK PROMPT HANDLER =====
   const handleQuickPrompt = (prompt: string) => {
     setUserInput(prompt);
+    setTimeout(() => inputRef.current?.focus(), 0);
   };
 
+  // ===== Context summary for side panel =====
+  const ctx: any = contextReport;
+  const ctxScore: number | null =
+    ctx?.analysis?.overall_score ?? ctx?.v2Analysis?.overall_score ?? ctx?.v2Report?.overall_score ?? null;
+  const ctxDoc: string | null = ctx?.document_name ?? null;
+  const ctxLabel =
+    ctx?.phase === 'analyzer' ? 'Iterative Analyzer'
+    : ctx?.phase === 'speech' ? 'Speech Analyzer'
+    : ctx?.phase === 'live' ? 'Live Coach'
+    : ctxDoc ? 'Document Analyzer'
+    : 'Practice session';
+  const hasContext = !!contextReport && (ctxScore !== null || !!ctxDoc);
+
   return (
-    <div className="practice-mode">
+    <div className="practice-mode da3-practice">
       {/* Practice Header with Gemini Status */}
       <div className="practice-header">
         <h1>AI Coach - Practice Mode</h1>
@@ -195,228 +272,216 @@ I have analyzed the progress you've made, as well as the remaining areas to poli
         {keyNotice && <div className="gemini-notice-banner">{keyNotice}</div>}
       </div>
 
-      {/* Main Chat Container */}
-      <section className="chat-container">
-        <div className="chat-messages" ref={chatContainerRef}>
-          {/* Render all messages */}
-          {messages.map((message) => (
-            <div key={message.id} className={`message-wrapper message-${message.role}`}>
-              <div className="message-bubble">
-                <div className="message-avatar">
-                  {message.role === 'ai' ? '✨' : '👤'}
-                </div>
-                <div className="message-content">
-                  {message.role === 'ai' && (
-                    <div className="message-sender-tag">
-                      <span className="coach-name">Presenova AI Coach</span>
-                      <span className="gemini-pill">Google Gemini</span>
-                    </div>
-                  )}
-                  <p className="message-text">{message.content}</p>
-                  <span className="message-timestamp">
-                    {new Date(message.timestamp).toLocaleTimeString([], {
-                      hour: '2-digit',
-                      minute: '2-digit',
-                    })}
-                  </span>
+      <div className="da3-layout">
+        {/* ===== MAIN: CHAT ===== */}
+        {/* UI_V1_DISABLED: <section className="chat-container"> (old wrapper, fixed 620px, padding 2.5rem) */}
+        <section className="da3-chat">
+          <div className="da3-chat-head">
+            <div className="da3-chat-head-left">
+              <span className="da3-chat-avatar">✨</span>
+              <div>
+                <div className="da3-chat-title">Presenova AI Coach</div>
+                <div className="da3-chat-sub">
+                  <span className="status-dot dot-active"></span> Online · {messages.length} message{messages.length === 1 ? '' : 's'}
                 </div>
               </div>
             </div>
-          ))}
+            <button type="button" className="da3-ghost-btn" onClick={handleClearChat} disabled={isLoading}>
+              🗑 Clear chat
+            </button>
+          </div>
 
-          {/* ===== LOADING INDICATOR ===== */}
-          {isLoading && (
-            <div className="message-wrapper message-ai">
-              <div className="message-bubble">
-                <div className="message-avatar">✨</div>
-                <div className="message-content">
-                  <div className="message-sender-tag">
-                    <span className="coach-name">Presenova AI Coach</span>
-                    <span className="gemini-pill">Generating...</span>
+          <div className="chat-messages" ref={chatContainerRef}>
+            {/* Render all messages */}
+            {messages.map((message) => (
+              <div key={message.id} className={`message-wrapper message-${message.role}`}>
+                <div className="message-bubble">
+                  <div className="message-avatar">
+                    {message.role === 'ai' ? '✨' : '👤'}
                   </div>
-                  <div className="typing-indicator">
-                    <div className="typing-dot"></div>
-                    <div className="typing-dot"></div>
-                    <div className="typing-dot"></div>
+                  <div className="message-content">
+                    {message.role === 'ai' && (
+                      <div className="message-sender-tag">
+                        <span className="coach-name">Presenova AI Coach</span>
+                        <span className="gemini-pill">Google Gemini</span>
+                      </div>
+                    )}
+                    {/* UI_V1_DISABLED: <p className="message-text">{message.content}</p> (showed raw ** and - symbols) */}
+                    <div className="da3-msg-body">{renderMessage(message.content)}</div>
+                    <span className="message-timestamp">
+                      {new Date(message.timestamp).toLocaleTimeString([], {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      })}
+                    </span>
                   </div>
-                  <p className="typing-text">Gemini is formulating actionable coaching feedback...</p>
                 </div>
               </div>
+            ))}
+
+            {/* ===== LOADING INDICATOR ===== */}
+            {isLoading && (
+              <div className="message-wrapper message-ai">
+                <div className="message-bubble">
+                  <div className="message-avatar">✨</div>
+                  <div className="message-content">
+                    <div className="message-sender-tag">
+                      <span className="coach-name">Presenova AI Coach</span>
+                      <span className="gemini-pill">Generating...</span>
+                    </div>
+                    <div className="typing-indicator">
+                      <div className="typing-dot"></div>
+                      <div className="typing-dot"></div>
+                      <div className="typing-dot"></div>
+                    </div>
+                    <p className="typing-text">Gemini is formulating actionable coaching feedback...</p>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Scroll anchor */}
+            <div ref={messagesEndRef} />
+          </div>
+
+          {/* Error Message Display */}
+          {error && (
+            <div className="error-message-box">
+              <span className="error-icon">⚠️</span>
+              <div className="error-body">
+                <span className="error-text">{error}</span>
+
+              </div>
+              <button
+                className="error-close"
+                onClick={() => setError(null)}
+                aria-label="Close error"
+              >
+                ✕
+              </button>
             </div>
           )}
 
-          {/* Scroll anchor */}
-          <div ref={messagesEndRef} />
-        </div>
-
-        {/* Error Message Display */}
-        {error && (
-          <div className="error-message-box">
-            <span className="error-icon">⚠️</span>
-            <div className="error-body">
-              <span className="error-text">{error}</span>
-
-            </div>
-            <button
-              className="error-close"
-              onClick={() => setError(null)}
-              aria-label="Close error"
-            >
-              ✕
-            </button>
-          </div>
-        )}
-
-        {/* Message Input Section */}
-        <div className="input-section">
-          <textarea
-            className="message-input"
-            value={userInput}
-            onChange={(e) => setUserInput(e.target.value)}
-            onKeyPress={handleKeyPress}
-            placeholder="Ask your AI Coach anything about your presentation, structure, pacing, or handling tough questions... (Enter to send, Shift+Enter for new line)"
-            disabled={isLoading}
-            rows={3}
-            maxLength={1000}
-          />
-
-          <div className="input-footer">
-            <span className="char-count">{userInput.length} / 1000</span>
-          </div>
-
-          <div className="input-actions">
-            <Button
-              label={isLoading ? 'Waiting for response...' : 'Send Message'}
-              onClick={handleSendMessage}
-              disabled={!userInput.trim() || isLoading}
-              loading={isLoading}
-            />
-            <Button
-              label="Clear Chat"
-              onClick={handleClearChat}
-              variant="secondary"
+          {/* Message Input Section */}
+          <div className="da3-input">
+            <textarea
+              ref={inputRef}
+              className="message-input"
+              value={userInput}
+              onChange={(e) => setUserInput(e.target.value)}
+              onKeyPress={handleKeyPress}
+              placeholder="Ask your AI Coach anything about your presentation, structure, pacing, or handling tough questions... (Enter to send, Shift+Enter for new line)"
               disabled={isLoading}
+              rows={3}
+              maxLength={1000}
             />
-          </div>
-        </div>
-      </section>
 
-      {/* Quick Suggestions Section */}
+            <div className="da3-input-bar">
+              <span className="char-count">{userInput.length} / 1000</span>
+              <div className="da3-input-actions">
+                <Button
+                  label={isLoading ? 'Waiting for response...' : 'Send Message'}
+                  onClick={handleSendMessage}
+                  disabled={!userInput.trim() || isLoading}
+                  loading={isLoading}
+                />
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* ===== SIDE PANEL ===== */}
+        <aside className="da3-side">
+          {/* Context card */}
+          <div className="da3-card">
+            <h3 className="da3-card-title">Session Context</h3>
+            {hasContext ? (
+              <div className="da3-ctx">
+                <div className="da3-ctx-row"><span>Source</span><strong>{ctxLabel}</strong></div>
+                {ctxDoc && <div className="da3-ctx-row"><span>Document</span><strong className="da3-ellipsis">{ctxDoc}</strong></div>}
+                {ctxScore !== null && <div className="da3-ctx-row"><span>Score</span><strong className="da3-ctx-score">{ctxScore}/100</strong></div>}
+                <p className="da3-ctx-note">Your coach has this report loaded and will tailor answers to it.</p>
+              </div>
+            ) : (
+              <p className="da3-muted">No report loaded. Analyze a document or speech first for personalized coaching, or just start chatting.</p>
+            )}
+          </div>
+
+          {/* Quick prompts, grouped */}
+          <div className="da3-card">
+            <h3 className="da3-card-title">Quick Prompts</h3>
+            <p className="da3-muted">Click a prompt to fill the message box:</p>
+            {PROMPT_GROUPS.map((group) => (
+              <div key={group.title} className="da3-group">
+                <div className="da3-group-title">{group.title}</div>
+                <div className="da3-prompts">
+                  {group.items.map((item) => (
+                    <button
+                      key={item.label}
+                      type="button"
+                      className="da3-prompt"
+                      onClick={() => handleQuickPrompt(item.prompt)}
+                      disabled={isLoading}
+                      title={item.prompt}
+                    >
+                      <span className="da3-prompt-icon">{item.icon}</span>
+                      <span>{item.label}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* About, collapsible */}
+          <div className="da3-card">
+            <button type="button" className="da3-about-toggle" onClick={() => setShowAbout(!showAbout)} aria-expanded={showAbout}>
+              <h3 className="da3-card-title">About Your Gemini AI Coach</h3>
+              <span className={`da3-chevron ${showAbout ? 'open' : ''}`}>▾</span>
+            </button>
+            {showAbout && (
+              <div className="da3-about-list">
+                {ABOUT_ITEMS.map((it) => (
+                  <div key={it.title} className="da3-about-item">
+                    <span className="da3-about-icon">{it.icon}</span>
+                    <div>
+                      <strong>{it.title}</strong>
+                      <p>{it.text}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </aside>
+      </div>
+
+      {/* UI_V1_DISABLED: old Quick Suggestions section (full-width, below chat)
       <section className="suggestions-section">
         <h3>Quick Prompts to Get Started</h3>
         <p className="suggestions-subtitle">Click any prompt or type your own message:</p>
         <div className="suggestions-grid">
-          <button
-            type="button"
-            className="suggestion-button"
-            onClick={() => handleQuickPrompt("How can I improve my presentation opening to hook my audience immediately?")}
-            disabled={isLoading}
-            title="Get tips on creating impactful opening statements"
-          >
-            Powerful Openings
-          </button>
-          <button
-            type="button"
-            className="suggestion-button"
-            onClick={() => handleQuickPrompt("I often use filler words like 'um' and 'like'. How can I reduce them?")}
-            disabled={isLoading}
-            title="Tips for reducing filler words"
-          >
-            Reduce Filler Words
-          </button>
-          <button
-            type="button"
-            className="suggestion-button"
-            onClick={() => handleQuickPrompt("What are the most common defense mistakes students make during viva examinations?")}
-            disabled={isLoading}
-            title="Learn about common presentation mistakes"
-          >
-            Viva Defense Pitfalls
-          </button>
-          <button
-            type="button"
-            className="suggestion-button"
-            onClick={() => handleQuickPrompt("I get nervous before speaking. What 2-minute technique can help me stay calm and confident?")}
-            disabled={isLoading}
-            title="Techniques to manage presentation anxiety"
-          >
-            Manage Anxiety
-          </button>
-          <button
-            type="button"
-            className="suggestion-button"
-            onClick={() => handleQuickPrompt("How should I pace my slides so I don't run out of time during a 10-minute presentation?")}
-            disabled={isLoading}
-            title="Learn optimal speaking pace"
-          >
-            Perfect Your Pace
-          </button>
-          <button
-            type="button"
-            className="suggestion-button"
-            onClick={() => handleQuickPrompt("How do I structure my problem statement and solution slides for maximum persuasion?")}
-            disabled={isLoading}
-            title="Get structured feedback on presentation"
-          >
-            Slide Architecture
-          </button>
+          <button type="button" className="suggestion-button" onClick={() => handleQuickPrompt("How can I improve my presentation opening to hook my audience immediately?")} disabled={isLoading} title="Get tips on creating impactful opening statements">Powerful Openings</button>
+          <button type="button" className="suggestion-button" onClick={() => handleQuickPrompt("I often use filler words like 'um' and 'like'. How can I reduce them?")} disabled={isLoading} title="Tips for reducing filler words">Reduce Filler Words</button>
+          <button type="button" className="suggestion-button" onClick={() => handleQuickPrompt("What are the most common defense mistakes students make during viva examinations?")} disabled={isLoading} title="Learn about common presentation mistakes">Viva Defense Pitfalls</button>
+          <button type="button" className="suggestion-button" onClick={() => handleQuickPrompt("I get nervous before speaking. What 2-minute technique can help me stay calm and confident?")} disabled={isLoading} title="Techniques to manage presentation anxiety">Manage Anxiety</button>
+          <button type="button" className="suggestion-button" onClick={() => handleQuickPrompt("How should I pace my slides so I don't run out of time during a 10-minute presentation?")} disabled={isLoading} title="Learn optimal speaking pace">Perfect Your Pace</button>
+          <button type="button" className="suggestion-button" onClick={() => handleQuickPrompt("How do I structure my problem statement and solution slides for maximum persuasion?")} disabled={isLoading} title="Get structured feedback on presentation">Slide Architecture</button>
         </div>
       </section>
+      */}
 
-      {/* Information Section */}
+      {/* UI_V1_DISABLED: old Information section (4 large cards, full-width)
       <section className="info-section">
         <h3>About Your Gemini AI Coach</h3>
         <div className="info-grid">
-          <div className="info-card">
-            <div className="info-icon">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
-                <circle cx="9" cy="7" r="4"></circle>
-                <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
-                <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
-              </svg>
-            </div>
-            <h4>Personalized Coaching</h4>
-            <p>Your AI Coach adapts to your specific presentation context, analyzing your 7Cs scores and pacing telemetry.</p>
-          </div>
-          <div className="info-card">
-            <div className="info-icon">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A5 5 0 0 0 8 8c0 1 .3 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"></path>
-                <line x1="9" y1="18" x2="15" y2="18"></line>
-                <line x1="10" y1="22" x2="14" y2="22"></line>
-              </svg>
-            </div>
-            <h4>Evidence-Based Delivery</h4>
-            <p>Every recommendation follows academic presentation frameworks, rhetorical structures, and speech cadence science.</p>
-          </div>
-          <div className="info-card">
-            <div className="info-icon">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <line x1="18" y1="20" x2="18" y2="10"></line>
-                <line x1="12" y1="20" x2="12" y2="4"></line>
-                <line x1="6" y1="20" x2="6" y2="14"></line>
-              </svg>
-            </div>
-            <h4>Google Gemini Powered</h4>
-            <p>Connected directly to Google Gemini 2.0 Flash for sub-second intelligence, low latency, and high reasoning fidelity.</p>
-          </div>
-          <div className="info-card">
-            <div className="info-icon">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
-                <path d="M8 10h.01"></path>
-                <path d="M12 10h.01"></path>
-                <path d="M16 10h.01"></path>
-              </svg>
-            </div>
-            <h4>Multi-Turn Defense Prep</h4>
-            <p>Ask follow-up questions, drill tough committee inquiries, and rehearse realistic defense cross-examinations.</p>
-          </div>
+          <div className="info-card"><h4>Personalized Coaching</h4><p>Your AI Coach adapts to your specific presentation context, analyzing your 7Cs scores and pacing telemetry.</p></div>
+          <div className="info-card"><h4>Evidence-Based Delivery</h4><p>Every recommendation follows academic presentation frameworks, rhetorical structures, and speech cadence science.</p></div>
+          <div className="info-card"><h4>Google Gemini Powered</h4><p>Connected directly to Google Gemini 2.0 Flash for sub-second intelligence, low latency, and high reasoning fidelity.</p></div>
+          <div className="info-card"><h4>Multi-Turn Defense Prep</h4><p>Ask follow-up questions, drill tough committee inquiries, and rehearse realistic defense cross-examinations.</p></div>
         </div>
       </section>
-
-
+      */}
     </div>
   );
 };

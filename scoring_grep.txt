@@ -1,0 +1,240 @@
+﻿
+ai_evaluator.py:371:        avg_posture = 
+context_metrics.get("avg_posture", 0)
+ai_evaluator.py:376:        has_visual_metrics = 
+context_metrics.get("has_visual_metrics", False) or 
+bool(avg_eye or avg_posture)
+ai_evaluator.py:383:            if avg_eye or avg_posture:
+ai_evaluator.py:384:                
+sub_scores.append((avg_eye + avg_posture) / 2)
+ai_evaluator.py:399:            recs_list.append("No video 
+metrics were captured, so eye contact and posture could 
+not be scored.")
+ai_evaluator.py:405:        if has_visual_metrics and 
+avg_posture >= 80:
+ai_evaluator.py:406:            
+strengths_list.append("Maintained professional upright 
+posture throughout the session.")
+ai_evaluator.py:408:            recs_list.append("Avoid 
+leaning or shifting; try to maintain a steady upright 
+posture.")
+ai_evaluator.py:449:            "Courteous": "Maintained 
+an upright, professional posture and showed courtesy to 
+examiners." if has_visual_metrics else "Posture-based 
+courtesy signals were unavailable because video scoring 
+did not run.",
+ai_evaluator.py:451:            "Consistent": f"Visual 
+focus and body posture remained consistent (posture: 
+{avg_posture}%) during delivery." if has_visual_metrics 
+else "Consistency could not be scored from visual metrics 
+because no valid video samples were captured."
+ai_evaluator.py:474:                    "Speak clearly and 
+stay in frame so eye contact and posture can be tracked."
+ai_evaluator.py:486:            courteous_score = max(30, 
+min(95, avg_posture if has_visual_metrics else 80))
+ai_evaluator.py:488:            consistent_score = max(30, 
+min(95, int((avg_eye * 0.5 + avg_posture * 0.5) if 
+has_visual_metrics else 75)))
+ai_evaluator.py:495:                    "Persuasion": 
+max(25, min(95, int(avg_eye * 0.5 + avg_posture * 0.5 if 
+has_visual_metrics else overall_score))),
+ai_evaluator.py:520:                    f"{'Average eye 
+contact was ' + str(avg_eye) + '% and posture was ' + 
+str(avg_posture) + '%. ' if has_visual_metrics else 
+'Visual metrics were not detected. '}"
+ai_evaluator.py:523:                    f"Continue 
+practicing to maintain high engagement and posture 
+throughout your presentation."
+ai_evaluator.py:693:        avg_posture = 
+context_metrics.get("avg_posture", 0)
+ai_evaluator.py:717:- Average Posture Score: 
+{avg_posture}/100
+ai_evaluator.py:739:        "Courteous": "<1-2 sentence 
+detailed evaluation on posture, examiner courtesy, and 
+presenter demeanor>",
+ai_evaluator.py:741:        "Consistent": "<1-2 sentence 
+detailed evaluation on posture stability and gaze pattern 
+uniformity>"
+ai_evaluator.py:753:        "<strength 1 based on posture, 
+eye contact or Q&A>",
+generate_pdf.py:147:        "Yeh slide decks, speech 
+acoustics, live camera posture, eye contact aur viva 
+cross-examination ko quantitatively evaluate karta hai.\n"
+generate_pdf.py:192:        "Server gaze deviation, 
+posture, aur filler words detect karke real-time hints 
+('Look at camera', 'Pacing too fast') wapis push karta 
+hai."
+generate_pdf.py:208:        "Vision pipeline me eye 
+contact aur posture kaise track hota hai?",
+generate_pdf.py:211:        "Head pose estimation pitch, 
+yaw aur roll se tilt aur posture composure track karti 
+hai."
+models.py:548:            "eye_contact_scores": [],
+models.py:549:            "posture_scores": [],
+models.py:563:            "eye_contact_scores": [],
+models.py:564:            "posture_scores": [],
+phase_live.py:300:def 
+_calculate_confidence(eye_contact_score, posture_score, 
+visibility_score=1.0, session=None):
+phase_live.py:301:    if eye_contact_score <= 0 or 
+posture_score <= 0 or visibility_score <= 0:
+phase_live.py:304:    quality = 
+math.sqrt((eye_contact_score / 100.0) * (posture_score / 
+100.0))
+phase_live.py:307:        eye_stability = _calculate_score_
+stability(session.metrics.get("eye_contact_scores", 
+[])[-8:])
+phase_live.py:308:        posture_stability = _calculate_sc
+ore_stability(session.metrics.get("posture_scores", 
+[])[-8:])
+phase_live.py:309:        stability = (eye_stability + 
+posture_stability) / 2.0
+phase_live.py:315:def 
+_smooth_visual_scores(eye_contact_score, posture_score, 
+session, face_detected=True):
+phase_live.py:317:        return eye_contact_score, 
+posture_score
+phase_live.py:319:    prev_eyes = 
+session.metrics.get("eye_contact_scores", [])[-4:]
+phase_live.py:320:    prev_postures = 
+session.metrics.get("posture_scores", [])[-4:]
+phase_live.py:324:    if eye_contact_score < 35:
+phase_live.py:325:        smoothed_eye = eye_contact_score
+phase_live.py:328:        if eye_contact_score < 
+avg_prev_eye:
+phase_live.py:329:            smoothed_eye = int(0.90 * 
+eye_contact_score + 0.10 * avg_prev_eye)
+phase_live.py:331:            smoothed_eye = int(0.50 * 
+eye_contact_score + 0.50 * avg_prev_eye)
+phase_live.py:333:        smoothed_eye = eye_contact_score
+phase_live.py:335:    if posture_score < 35:
+phase_live.py:336:        smoothed_posture = posture_score
+phase_live.py:337:    elif prev_postures:
+phase_live.py:338:        avg_prev_posture = 
+sum(prev_postures) / len(prev_postures)
+phase_live.py:339:        if posture_score < 
+avg_prev_posture:
+phase_live.py:340:            smoothed_posture = int(0.80 
+* posture_score + 0.20 * avg_prev_posture)
+phase_live.py:342:            smoothed_posture = int(0.50 
+* posture_score + 0.50 * avg_prev_posture)
+phase_live.py:344:        smoothed_posture = posture_score
+phase_live.py:346:    return smoothed_eye, smoothed_posture
+phase_live.py:349:def _visual_result(eye_contact_score, 
+posture_score, hint, emotion=None, session=None, 
+face_detected=True, visibility_score=1.0):
+phase_live.py:350:    eye_contact_score, posture_score = 
+_smooth_visual_scores(
+phase_live.py:351:        _clip_score(eye_contact_score),
+phase_live.py:352:        _clip_score(posture_score),
+phase_live.py:357:        eye_contact_score,
+phase_live.py:358:        posture_score,
+phase_live.py:366:        elif eye_contact_score >= 80 and 
+posture_score >= 80:
+phase_live.py:368:        elif eye_contact_score >= 65 and 
+posture_score >= 65:
+phase_live.py:370:        elif eye_contact_score < 45:
+phase_live.py:377:        "eye_contact": eye_contact_score,
+phase_live.py:378:        "eye_contact_score": 
+eye_contact_score,
+phase_live.py:379:        "posture": posture_score,
+phase_live.py:380:        "posture_score": posture_score,
+phase_live.py:392:        "eye_contact_score": 0,
+phase_live.py:393:        "posture_score": 0,
+phase_live.py:527:    # eye_contact_score straight to 0 
+the instant ANY one of six tight thresholds
+phase_live.py:534:    # weighted-penalty style as the 
+posture score below), with a wider
+phase_live.py:539:        eye_contact_score = 0
+phase_live.py:542:        eye_contact_score = 
+_clip_score(100 - (total_dev * 110), 0, 100)
+phase_live.py:544:            eye_contact_score = max(0, 
+eye_contact_score - 20)
+phase_live.py:561:    posture_score = _clip_score(
+phase_live.py:567:    if posture_score < 70:
+phase_live.py:575:            hint = "Sit upright and keep 
+a steady posture."
+phase_live.py:576:    elif eye_contact_score < 70:
+phase_live.py:582:        hint = "Good eye contact and 
+posture!"
+phase_live.py:585:        eye_contact_score,
+phase_live.py:586:        posture_score,
+phase_live.py:657:        posture_score = _clip_score(100 
+- x_penalty - y_penalty - size_penalty, 0, 100)
+phase_live.py:668:        # Face is clearly present! 
+Position/posture is solid.
+phase_live.py:671:        eye_contact_score = 
+int(_clip_score(45 + centered_bonus, 30, 80))
+phase_live.py:672:        hint = "Face detected. Look 
+directly at the camera lens for optimal eye contact." if 
+posture_score >= 70 else "Sit upright and look at the 
+camera."
+phase_live.py:674:            eye_contact_score,
+phase_live.py:675:            posture_score,
+phase_live.py:677:            emotion="Focused" if 
+posture_score >= 70 else "Nervous",
+phase_live.py:724:        eye_contact_score = 
+int(_clip_score(70 - dev_penalty, 25, 80))
+phase_live.py:727:        eye_contact_score = 20
+phase_live.py:748:        eye_contact_score = 
+int(_clip_score(base_raw_score - gaze_penalty, 30, 100))
+phase_live.py:750:    if posture_score < 70:
+phase_live.py:758:            hint = "Adjust your posture 
+to sit straight."
+phase_live.py:759:    elif eye_contact_score < 60:
+phase_live.py:762:        hint = "Good eye contact and 
+posture!"
+phase_live.py:765:        eye_contact_score,
+phase_live.py:766:        posture_score,
+phase_live.py:775:    Analyzes a base64 encoded video 
+frame for eye contact and posture alignment.
+phase_live.py:1064:                    "eye_contact": 0,
+phase_live.py:1065:                    "posture": 0,
+phase_live.py:1073:            
+session.update_metrics("eye_contact_scores", 
+metrics["eye_contact"])
+phase_live.py:1074:            
+session.update_metrics("posture_scores", 
+metrics["posture"])
+phase_live.py:1080:                "eye_contact": 
+metrics["eye_contact"],
+phase_live.py:1081:                "posture": 
+metrics["posture"],
+phase_live.py:1296:        eye_scores = 
+session.metrics.get("eye_contact_scores", [])
+phase_live.py:1297:        posture_scores = 
+session.metrics.get("posture_scores", [])
+phase_live.py:1310:        avg_posture = 
+avg_or_zero(posture_scores)
+phase_live.py:1321:        has_enough_video = 
+len(eye_scores) >= MIN_VALID_VIDEO_SAMPLES and 
+len(posture_scores) >= MIN_VALID_VIDEO_SAMPLES
+phase_live.py:1324:        visual_presence = int((avg_eye 
++ avg_posture) / 2) if has_enough_video else None
+phase_live.py:1369:                "avg_posture": 
+avg_posture,
+phase_live.py:1414:            "avg_eye_contact": avg_eye,
+phase_live.py:1415:            "avg_posture": avg_posture,
+tests\test_live_coach_fixture.py:51:    print(f"✅ Eye 
+Contact Score: {v_metrics.get('eye_contact', 0)}")
+tests\test_live_coach_fixture.py:52:    print(f"✅ Posture 
+Score: {v_metrics.get('posture', 0)}")
+tests\test_live_coach_fixture.py:72:        "avg_posture": 
+92,
+tests\test_offline_nlp.py:55:    live_res = 
+evaluate_7cs(sample_presentation, module_type='live', 
+context_metrics={"avg_eye": 88, "avg_posture": 92, 
+"avg_wpm": 140, "fillers": 2, "avg_qna": 85})
+tools\enhance_gamma_doc.py:308:        "ratios using iris 
+displacement, monitors blink frequency via Eye Aspect 
+Ratio (EAR < 0.16), and tracks head posture yaw/pitch "
+tools\enhance_gamma_doc.py:338:        ["Head Posture & 
+Slouch Detection", "Yes (Nose landmark 1 & symmetry 
+heuristics)", "No", "No"],
+tools\test_verification.py:36:p("Eye contact score:", 
+res.get("eye_contact"))
+tools\test_verification.py:37:p("Posture score:", 
+res.get("posture"))
+tools\test_verification.py:46:    "avg_posture": 82,
+
+

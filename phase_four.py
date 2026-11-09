@@ -26,13 +26,18 @@ def _is_valid_groq_key(key: str | None) -> bool:
     """Groq API keys start with 'gsk_'."""
     return bool(key) and key.startswith('gsk_') and len(key) > 20
 
-# Initialize Groq client if key is configured (with timeout=4.0s for ISSUE-07)
+# Initialize Groq client if key is configured.
+# Timeout raised from 4s to 30s: audio uploads take several seconds, and a 4s timeout
+# would now surface as a "transcription failed" error instead of a fake transcript.
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 groq_client = None
 if _is_valid_groq_key(GROQ_API_KEY):
-    groq_client = Groq(api_key=GROQ_API_KEY, timeout=4.0)
+    groq_client = Groq(api_key=GROQ_API_KEY, timeout=30.0)
 else:
     logger.warning("[PHASE-4] GROQ_API_KEY not configured or invalid. STT unavailable.")
+
+# Whisper drops um/uh unless the prompt shows fillers.
+WHISPER_FILLER_PROMPT = "Umm, let me think, like, hmm... Okay, so, uh, basically, you know, I'm, like, thinking about it, actually."
 
 # Gemini API configured globally in ai_evaluator
 
@@ -45,7 +50,7 @@ def run_gemini_speech_analysis(
     duration_seconds: int
 ) -> dict:
     """
-    Run Gemini 1.5 Flash to generate a full 7Cs speech scorecard via central evaluator.
+    Run Gemini to generate a full 7Cs speech scorecard via central evaluator.
     """
     from ai_evaluator import evaluate_7cs
     return evaluate_7cs(
@@ -69,6 +74,7 @@ phase_four_bp = Blueprint('phase_four', __name__, url_prefix='/api')
 def count_repetitions(text: str) -> int:
     """
     Count consecutive word repetitions in the text.
+    Single-letter repeats are ignored except "I I" (a common spoken stumble).
     """
     words = text.lower().split()
     repetition_count = 0
@@ -77,10 +83,30 @@ def count_repetitions(text: str) -> int:
         current_word = words[i].strip('.,!?;:')
         next_word = words[i + 1].strip('.,!?;:')
 
-        if current_word == next_word and len(current_word) > 1:
+        if current_word == next_word and (len(current_word) > 1 or current_word == 'i'):
             repetition_count += 1
 
     return repetition_count
+
+
+def unify_clarity(gemini_result: dict, rule_clarity: int) -> int:
+    """One final clarity number: average of the rule-based score and the AI score.
+
+    The same number is written back into the AI category score ("Clarity") and the
+    7Cs score ("Clear") so the card, category and 7Cs views never disagree.
+    """
+    cats = gemini_result.get("category_scores") or {}
+    ai_clarity = cats.get("Clarity")
+    if isinstance(ai_clarity, (int, float)):
+        final = int(round((rule_clarity + ai_clarity) / 2))
+    else:
+        final = rule_clarity
+    if cats:
+        cats["Clarity"] = final
+    scores = gemini_result.get("seven_cs_scores")
+    if scores:
+        scores["Clear"] = final
+    return final
 
 
 def analyze_speech_quality(
@@ -201,6 +227,7 @@ def analyze_speech():
             repetition_count=repetition_count,
             duration_seconds=duration_seconds
         )
+        final_clarity = unify_clarity(gemini_result, quality_analysis["clarity_score"])
 
         analysis_result = {
             "success": True,        # AUDIT-08: Unified API contract — all success responses carry success:True
@@ -212,7 +239,7 @@ def analyze_speech():
             "repetition_count": repetition_count,
             "duration_seconds": duration_seconds,
             "actionable_feedback": quality_analysis["feedback"],
-            "clarity_score": quality_analysis["clarity_score"],
+            "clarity_score": final_clarity,
             "transcript": speech_text,
             "overall_score": gemini_result.get("overall_score", quality_analysis["clarity_score"]),
             "category_scores": gemini_result.get("category_scores"),
@@ -263,7 +290,7 @@ def analyze_audio():
         return guest_check
 
     permanent_audio_path = None
-    
+
     try:
         # ===== STEP 1: VALIDATE REQUEST DATA =====
         if 'file' not in request.files:
@@ -272,17 +299,17 @@ def analyze_audio():
                 "error": "NoFileProvided",
                 "message": "Please upload an audio file with key 'file'"
             }), 400
-            
+
         file = request.files['file']
         duration_seconds = int(request.form.get('duration_seconds', 0))
-        
+
         if file.filename == '':
             return jsonify({
                 "success": False,
                 "error": "EmptyFile",
                 "message": "Please select a file to upload"
             }), 400
-            
+
         ALLOWED_AUDIO_EXTENSIONS = {'.wav', '.mp3', '.m4a', '.ogg', '.webm', '.flac'}
         file_ext = os.path.splitext(file.filename)[1].lower()
         if file_ext not in ALLOWED_AUDIO_EXTENSIONS:
@@ -298,7 +325,7 @@ def analyze_audio():
                 "error": "InvalidDuration",
                 "message": "Please provide a valid speaking duration in seconds"
             }), 400
-            
+
         # Secure permanent file storage (ISSUE-14)
         upload_folder = os.path.join(os.getcwd(), 'instance', 'uploads', str(uuid.uuid4()))
         os.makedirs(upload_folder, exist_ok=True)
@@ -306,7 +333,7 @@ def analyze_audio():
         permanent_audio_path = os.path.join(upload_folder, safe_filename)
         file.save(permanent_audio_path)
         logger.info("Saved audio upload: %s (%d bytes)", permanent_audio_path, os.path.getsize(permanent_audio_path))
-            
+
         # ===== STEP 2: TRANSCRIBE AUDIO (Groq Whisper API) =====
         transcript = ""
         stt_fallback = False  # FIX-6: track whether Groq STT succeeded or fell back
@@ -318,25 +345,34 @@ def analyze_audio():
                     transcription = groq_client.audio.transcriptions.create(
                         file=(file.filename, audio_file.read()),
                         model="whisper-large-v3",
-                        language="en"
+                        language="en",
+                        prompt=WHISPER_FILLER_PROMPT,
+                        temperature=0.0
                     )
                     transcript = transcription.text
             except (RateLimitError, APITimeoutError) as rate_err:
                 logger.warning("Groq Whisper transcription rate-limited or timed out: %s", rate_err)
-                # Graceful degraded fallback to avoid hanging or failing
-                transcript = "Hello! Um, I am trying to explain this presentation. It covers our key objectives, methodology, and results."
                 stt_fallback = True
             except Exception as e:
                 logger.warning("Groq Whisper transcription failed: %s", e)
-                # Graceful fallback to avoid server crash
-                transcript = "Hello! Um, I am trying to explain this, you know, basically to the audience. Actually, it is kind of working well."
                 stt_fallback = True
         else:
-            # Fallback mock transcription for local offline development
-            logger.warning("GROQ_API_KEY not configured. Using fallback mock transcription.")
-            transcript = "Hello! Um, I am trying to explain this, you know, basically to the audience. Actually, it is kind of working well."
+            logger.warning("GROQ_API_KEY not configured. Transcription unavailable.")
             stt_fallback = True
-            
+
+        # If transcription failed, return a clear error instead of analysing a FAKE transcript.
+        if stt_fallback:
+            if permanent_audio_path and os.path.exists(permanent_audio_path):
+                try:
+                    os.remove(permanent_audio_path)
+                except OSError:
+                    pass
+            return jsonify({
+                "success": False,
+                "error": "TranscriptionUnavailable",
+                "message": "Speech transcription failed. Please try again."
+            }), 503
+
         if not transcript.strip():
             if permanent_audio_path and os.path.exists(permanent_audio_path):
                 try:
@@ -348,7 +384,7 @@ def analyze_audio():
                 "error": "NoSpeechDetected",
                 "message": "Whisper STT could not transcribe any speech. Please make sure the audio contains clear speaking."
             }), 400
-            
+
         # ===== STEP 3: RUN METRICS CALCULATIONS =====
         words = transcript.split()
         word_count = len([w for w in words if w.strip()])
@@ -371,7 +407,7 @@ def analyze_audio():
             filler_percentage=filler_percentage,
             repetition_count=repetition_count
         )
-        
+
         # ===== STEP 4: 7Cs SPEECH EVALUATION (Gemini API) =====
         gemini_result = run_gemini_speech_analysis(
             transcript=transcript,
@@ -381,12 +417,13 @@ def analyze_audio():
             repetition_count=repetition_count,
             duration_seconds=duration_seconds
         )
-        
+        final_clarity = unify_clarity(gemini_result, quality_analysis["clarity_score"])
+
         # ===== STEP 5: COMPILE REPORT RESULTS =====
         analysis_result = {
             "success": True,
             "status": "success",
-            "stt_fallback": stt_fallback,   # FIX-6: frontend can show a warning if True
+            "stt_fallback": stt_fallback,   # always False here (failures return 503 above); kept for API compatibility
             "word_count": word_count,
             "speech_speed_wpm": speech_speed_wpm,
             "filler_words_count": filler_count,
@@ -394,7 +431,7 @@ def analyze_audio():
             "repetition_count": repetition_count,
             "duration_seconds": duration_seconds,
             "actionable_feedback": quality_analysis["feedback"],
-            "clarity_score": quality_analysis["clarity_score"],
+            "clarity_score": final_clarity,
             "transcript": transcript,
             "overall_score": gemini_result.get("overall_score", quality_analysis["clarity_score"]),
             "category_scores": gemini_result.get("category_scores"),
@@ -406,27 +443,27 @@ def analyze_audio():
             "improved_text": gemini_result.get("improved_text"),
             "analysis_timestamp": datetime.now(timezone.utc).isoformat()
         }
-        
+
         # ===== STEP 6: SAVE TO DATABASE =====
         user_id = get_jwt_identity() or "guest"
-        
+
         upload_record = Upload.create(
             filename=file.filename,
             mime_type=file.mimetype or f"audio/{file_ext[1:]}",
             file_path=permanent_audio_path,
             user_id=user_id
         )
-        
+
         Report.create(
             report_json=analysis_result,
             report_type='speech_analysis',
             user_id=user_id,
             upload_id=upload_record.id
         )
-        
+
         logger.info("Speech audio analysis completed and saved for: %s", file.filename)
         return jsonify(analysis_result), 200
-        
+
     except Exception as e:
         logger.error("Audio analysis failed: %s", e, exc_info=True)
         if permanent_audio_path and os.path.exists(permanent_audio_path):

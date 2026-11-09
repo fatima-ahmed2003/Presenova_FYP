@@ -1,7 +1,7 @@
 """
 End-to-end orchestration for the AI Presentation Enhancement Platform.
 
-Integrates all new modular components:
+Integrates all modular components:
 - Provider abstraction (services/ai/)
 - Analysis modules (services/analysis/)
 - Rewrite modules (services/rewrite/)
@@ -9,7 +9,25 @@ Integrates all new modular components:
 - Report modules (services/report/)
 - Existing services (ppt_processor, download_service, etc.)
 
-Maintains full backward compatibility with existing API endpoints.
+Maintains backward compatibility with the existing API endpoints.
+
+Honesty changes in this version:
+- `quality_scores['analysis_available']` tells whether the AI analysis was real.
+- Pre-analysis recommendations are only fed to the rewrite when the analysis was real.
+- The "improvements" list is built from REAL change counts, not score thresholds.
+- Rewrite execution metrics (AI vs rule-based, guard reverts) are returned.
+- Grammar/Spelling/Conciseness "addressed" lines were REMOVED from
+  _build_improvements_summary: they used to fire from a category SCORE
+  THRESHOLD regardless of whether that category's text was actually
+  touched by the rewrite — fabricated ticks (e.g. "Spelling corrected
+  throughout" even when nothing changed).
+
+Consistency change in this version:
+- After the rewrite, a cross-slide consistency pass (services/consistency.py)
+  makes sure the SAME source typo is corrected the SAME way on every slide
+  (e.g. "Vehcal" -> always "Vehicle", never a mix of "Vehicle"/"Vehicles").
+  It runs without any AI call and is wrapped in try/except, so it can never
+  break the pipeline.
 """
 
 import json
@@ -37,6 +55,7 @@ from services.rewrite import SmartFilter, RewritePlanner, RewriteExecutor
 from services.validation import SemanticValidator, StructuralValidator, FinalValidator
 from services.report import ExecutiveSummaryGenerator, AnalyticsGenerator, RecommendationsGenerator
 
+from services.consistency import harmonize_slides, harmonize_footers
 from services.download_service import (
     ensure_download_folder,
     generate_output_filename,
@@ -59,6 +78,71 @@ from services.text_extractor import (
 from tools.compare_pptx import compare_pptx_files
 
 logger = logging.getLogger(__name__)
+
+# Phrases the analyzer uses when it fell back to default placeholder scores.
+_UNAVAILABLE_MARKERS = (
+    'could not be completed',
+    'analysis was not available',
+    'analysis unavailable',
+    'default scores shown',
+    'upload with a configured ai provider',
+)
+
+
+def _analysis_is_real(quality_scores) -> bool:
+    """True only when quality_scores came from a real AI analysis."""
+    if not isinstance(quality_scores, dict) or not quality_scores:
+        return False
+    if quality_scores.get('analysis_available') is False:
+        return False
+    evaluations = quality_scores.get('seven_cs_evaluation') or {}
+    blob = ' '.join([
+        str(quality_scores.get('summary', '')),
+        ' '.join(str(i) for i in (quality_scores.get('issues_found') or [])),
+        ' '.join(str(r) for r in (quality_scores.get('recommendations') or [])),
+        ' '.join(str(v) for v in evaluations.values()),
+    ]).lower()
+    return not any(marker in blob for marker in _UNAVAILABLE_MARKERS)
+
+
+def _extract_paragraph_text(value) -> str:
+    """Extract plain display text from a paragraph value.
+
+    RewriteExecutor / validators sometimes pass richer paragraph objects
+    like {'para_index': 0, 'text': '...', 'runs': [...]} for run-level
+    diffing. The PPT writer only ever wants the plain 'text' — never the
+    raw dict repr, which would render as literal text on the slide.
+    """
+    if isinstance(value, dict):
+        return str(value.get('text', ''))
+    return str(value)
+
+
+def _count_text_changes(original_slides: list, rewritten_slides: list) -> dict:
+    """Count how many text paragraphs were REALLY changed by the rewrite."""
+    rewritten_map = {}
+    for slide in rewritten_slides or []:
+        shapes = {}
+        for tb in slide.get('textboxes', []) or []:
+            shapes[tb.get('shape_index')] = [
+                _extract_paragraph_text(p) for p in tb.get('paragraphs', []) or []
+            ]
+        rewritten_map[slide.get('slide_number')] = shapes
+
+    total = 0
+    changed = 0
+    for slide in original_slides or []:
+        shapes = rewritten_map.get(slide.get('slide_number'), {})
+        for tb in slide.get('textboxes', []) or []:
+            new_paras = shapes.get(tb.get('shape_index'))
+            for i, p in enumerate(tb.get('paragraphs', []) or []):
+                orig_text = _extract_paragraph_text(p).strip()
+                if not orig_text:
+                    continue
+                total += 1
+                if new_paras is not None and i < len(new_paras) and new_paras[i].strip() != orig_text:
+                    changed += 1
+    return {'total': total, 'changed': changed}
 
 
 def run_rewrite_pipeline(
@@ -110,6 +194,10 @@ def run_rewrite_pipeline(
 
     # ── Step 4: Initialize providers and analyzers ─────────────────────
     provider = get_provider()
+    ai_available = provider.is_available()
+    if not ai_available:
+        logger.warning('[rewrite_engine] AI provider is NOT available; rule-based fallback will be used.')
+        steps.append('AI provider unavailable — using rule-based fallback')
     fallback = FallbackManager(primary_provider=provider)
     planner = RewritePlanner(mode=mode, tone=tone)
     smart_filter = SmartFilter()
@@ -140,7 +228,15 @@ def run_rewrite_pipeline(
     quality_scores = per_slide_analyzer.analyze_presentation(
         extracted_text, original_filename, mode
     )
-    steps.append('Running 7Cs semantic quality analysis — evaluating clarity, conciseness, correctness, completeness')
+    if not isinstance(quality_scores, dict):
+        quality_scores = {}
+    analysis_ok = _analysis_is_real(quality_scores)
+    quality_scores['analysis_available'] = analysis_ok
+    if analysis_ok:
+        steps.append('Running 7Cs semantic quality analysis — evaluating clarity, conciseness, correctness, completeness')
+    else:
+        logger.warning('[rewrite_engine] Quality analysis returned default/placeholder scores for %r.', original_filename)
+        steps.append('AI quality analysis unavailable — default placeholder scores (not a real evaluation)')
 
     # ── Step 7: Additional analyses (design, storytelling, etc.) ───────
     stats = compute_presentation_statistics(slides)
@@ -154,19 +250,54 @@ def run_rewrite_pipeline(
     speaker_analysis = speaker_analyzer.analyze(slides)
     steps.append('Checking design consistency, storytelling arc, accessibility compliance, and speaker notes quality')
 
-    # ── Step 8: Smart filter optimization ──────────────────────────────
+    # ── Step 8: Token savings estimate (informational only) ────────────
+    # NOTE: SmartFilter currently sends every slide that has text to the AI,
+    # so this estimate is NOT reported to the user as a real saving.
     token_savings = smart_filter.estimate_token_savings(slides)
-    if token_savings['savings_percent'] > 5:
-        steps.append(
-            f"Smart filter saved ~{token_savings['savings_percent']}% tokens"
-        )
 
     # ── Step 9: Execute rewrite ────────────────────────────────────────
+    # Only feed pre-analysis recommendations to the rewrite when they are real.
+    focus_items = quality_scores.get('recommendations', []) if analysis_ok else None
     rewritten_slides, rewrite_metrics = executor.execute_rewrite(
         slides, grammar_summary, presentation_context,
-        focus_items=quality_scores.get('recommendations', []),
+        focus_items=focus_items,
     )
-    steps.append(f'Generating AI-enhanced rewrites for {len(rewritten_slides)} slides with tone & 7Cs alignment')
+
+    # ── Step 9b: Cross-slide consistency pass (no AI call, never fatal) ─
+    # Same source typo must be corrected the same way on every slide.
+    consistency_fixes = 0
+    try:
+        rewritten_slides, consistency_log = harmonize_slides(slides, rewritten_slides)
+        consistency_fixes = len(consistency_log)
+        if consistency_fixes:
+            logger.info(
+                '[rewrite_engine] Consistency pass normalized %d inconsistent correction(s): %s',
+                consistency_fixes, consistency_log,
+            )
+    except Exception as exc:
+        logger.warning('[rewrite_engine] Consistency pass skipped (non-fatal): %s', exc)
+    # Footers / running text must read identically on every slide.
+    try:
+        rewritten_slides, footer_log = harmonize_footers(rewritten_slides)
+        if footer_log:
+            consistency_fixes += len(footer_log)
+            logger.info(
+                '[rewrite_engine] Footer pass unified %d running-text line(s): %s',
+                len(footer_log), footer_log,
+            )
+    except Exception as exc:
+        logger.warning('[rewrite_engine] Footer pass skipped (non-fatal): %s', exc)
+    rewrite_metrics['consistency_fixes'] = consistency_fixes
+
+    change_stats = _count_text_changes(slides, rewritten_slides)
+    steps.append(
+        f"Rewrote {len(rewritten_slides)} slides: "
+        f"{rewrite_metrics.get('ai_slides_succeeded', 0)} by AI, "
+        f"{rewrite_metrics.get('rule_based_slides', 0)} by rule-based fallback; "
+        f"{change_stats['changed']} of {change_stats['total']} text elements changed"
+    )
+    if consistency_fixes:
+        steps.append(f'Unified {consistency_fixes} inconsistent spelling correction(s) across slides')
 
     # ── Step 10: Validate rewritten content ────────────────────────────
     semantic_result = semantic_validator.validate(slides, rewritten_slides)
@@ -213,8 +344,10 @@ def run_rewrite_pipeline(
         original_slides=slides,
         output_path=output_path,
     )
+
     # ── Step 14: Post-save validation (soft-fail) ───────────────────────
     preservation_ok = True
+    comparison = {}
     try:
         comparison = compare_pptx_files(temp_file_path, output_path)
         preservation_ok = comparison.get('visually_identical_structure', False)
@@ -227,7 +360,7 @@ def run_rewrite_pipeline(
         logger.warning('[rewrite_engine] Preservation check itself failed: %s', exc)
         comparison = {}
     steps.append('Improved presentation generated')
-    steps.append('Preservation verified' if preservation_ok else 'Preservation check flagged differences (file kept — please review)')    
+    steps.append('Preservation verified' if preservation_ok else 'Preservation check flagged differences (file kept — please review)')
 
     # ── Step 15: Save per-slide comparison report ─────────────────────
     try:
@@ -239,7 +372,6 @@ def run_rewrite_pipeline(
             'quality_scores': quality_scores,
             'slides': slide_report,
             'generated_at': None,
-            # New fields
             'final_assessment': final_assessment,
             'executive_summary': executive_summary,
             'analytics': analytics,
@@ -269,15 +401,16 @@ def run_rewrite_pipeline(
             'semantic_validation': semantic_result,
             'structural_validation': structural_result,
             'rewrite_metrics': rewrite_metrics,
+            'change_stats': change_stats,
+            'analysis_available': analysis_ok,
             'processing_metadata': {
                 'mode': mode,
                 'tone': tone,
-                'model': provider.get_model_info() if provider.is_available() else 'local',
-                'provider': 'gemini',
+                'model': provider.get_model_info() if ai_available else 'local',
+                'provider': 'gemini' if ai_available else 'local',
                 'retry_count': rewrite_metrics.get('retry_count', 0),
                 'fallback_used': rewrite_metrics.get('fallback_count', 0) > 0,
                 'total_ai_calls': rewrite_metrics.get('model_calls', 0),
-                'smart_filter_savings': token_savings.get('savings_percent', 0),
             },
         }
         save_report_json(report_payload, output_path)
@@ -286,8 +419,13 @@ def run_rewrite_pipeline(
         logger.warning('[rewrite_engine] Could not save report: %s', exc)
         steps.append('Report saving failed')
 
-    # ── Build improvements list ───────────────────────────────────────
-    improvements = _build_improvements_summary(quality_scores, final_assessment)
+    # ── Build improvements list (from REAL changes) ───────────────────
+    improvements = _build_improvements_summary(
+        quality_scores, final_assessment,
+        change_stats=change_stats,
+        rewrite_metrics=rewrite_metrics,
+        analysis_ok=analysis_ok,
+    )
 
     return {
         'output_filename': output_filename,
@@ -297,10 +435,15 @@ def run_rewrite_pipeline(
         'processing_steps': steps,
         'metadata': {
             **metadata,
-            'preservation_check': _comparison_summary(comparison) if 'comparison' in locals() else {},
+            'preservation_check': _comparison_summary(comparison) if comparison else {},
         },
         'mode': mode,
         'tone': tone,
+        'analysis_available': analysis_ok,
+        'execution_metrics': {**rewrite_metrics, **{
+            'text_elements_total': change_stats['total'],
+            'text_elements_changed': change_stats['changed'],
+        }},
         'final_assessment': final_assessment,
         'executive_summary': executive_summary,
         'analytics': analytics,
@@ -320,10 +463,7 @@ def run_analysis_pipeline(
     temp_file_path: str,
     original_filename: str,
 ) -> dict:
-    """Analyze PPTX/PDF text without creating a rewritten file.
-
-    Uses the new analysis modules for comprehensive scoring.
-    """
+    """Analyze PPTX/PDF text without creating a rewritten file."""
     extension = get_extension(original_filename)
     if not is_allowed_for_analysis(original_filename):
         raise ValueError(f"Unsupported file type '{extension}'. Supported: .pptx, .pdf")
@@ -345,9 +485,13 @@ def run_analysis_pipeline(
     provider = get_provider()
     analyzer = PerSlideAnalyzer(provider=provider)
     quality_scores = analyzer.analyze_presentation(extracted_text, original_filename)
-    steps.append('AI quality analysis complete')
+    if not isinstance(quality_scores, dict):
+        quality_scores = {}
+    analysis_ok = _analysis_is_real(quality_scores)
+    quality_scores['analysis_available'] = analysis_ok
+    steps.append('AI quality analysis complete' if analysis_ok
+                 else 'AI quality analysis unavailable — default placeholder scores')
 
-    # Additional analyses if slides extracted
     extra_analyses = {}
     if slides:
         stats = compute_presentation_statistics(slides)
@@ -364,11 +508,9 @@ def run_analysis_pipeline(
             'total_charts': stats.total_charts,
         }
 
-        # Quick design analysis
         design_analyzer = DesignAnalyzer()
         extra_analyses['design'] = design_analyzer.analyze(slides)
 
-        # Quick consistency check
         consistency_analyzer = ConsistencyAnalyzer()
         extra_analyses['consistency'] = consistency_analyzer.analyze(slides)
 
@@ -381,18 +523,6 @@ def run_analysis_pipeline(
         'analyses': extra_analyses,
     }
 
-
-def _extract_paragraph_text(value) -> str:
-    """Extract plain display text from a paragraph value.
-
-    RewriteExecutor / validators sometimes pass richer paragraph objects
-    like {'para_index': 0, 'text': '...', 'runs': [...]} for run-level
-    diffing. The PPT writer only ever wants the plain 'text' — never the
-    raw dict repr, which would render as literal text on the slide.
-    """
-    if isinstance(value, dict):
-        return str(value.get('text', ''))
-    return str(value)
 
 def _convert_gemini_to_ppt_format(gemini_slides: list[dict]) -> list[dict]:
     """Normalise already-validated Gemini output for the PPT writer."""
@@ -452,51 +582,55 @@ def _comparison_summary(comparison: dict) -> dict:
 def _build_improvements_summary(
     quality_scores: dict,
     final_assessment: Optional[dict] = None,
+    change_stats: Optional[dict] = None,
+    rewrite_metrics: Optional[dict] = None,
+    analysis_ok: bool = False,
 ) -> list[str]:
-    """Build user-friendly improvement descriptions."""
+    """Build improvement descriptions from what REALLY happened.
+
+    Generic claims ("spelling corrected throughout") are only added when the
+    AI analysis was real AND the rewrite actually changed text.
+    """
     improvements = []
+    change_stats = change_stats or {'total': 0, 'changed': 0}
+    rewrite_metrics = rewrite_metrics or {}
 
-    if final_assessment:
-        change_metrics = final_assessment.get('change_metrics', {})
-        if change_metrics.get('major_rewrites', 0) > 0:
-            improvements.append(
-                f"{change_metrics['major_rewrites']} sections received major improvements"
-            )
-        if change_metrics.get('moderate_improvements', 0) > 0:
-            improvements.append(
-                f"{change_metrics['moderate_improvements']} text elements moderately improved"
-            )
-        if change_metrics.get('minor_improvements', 0) > 0:
-            improvements.append(
-                f"{change_metrics['minor_improvements']} text elements polished for clarity"
-            )
+    changed = change_stats.get('changed', 0)
+    total = change_stats.get('total', 0)
 
+    if total == 0:
+        return ['No editable text was found in this presentation.']
+    if changed == 0:
+        return ['No text changes were needed — the existing wording was kept.']
+
+    improvements.append(f'{changed} of {total} text elements were edited')
+
+    reverted = rewrite_metrics.get('guard_reverted_paragraphs', 0) + rewrite_metrics.get('guard_reverted_textboxes', 0)
+    if reverted:
+        improvements.append(
+            f'{reverted} risky AI edit(s) were blocked to protect your numbers, footers and original wording'
+        )
+
+    if rewrite_metrics.get('fallback_count', 0) > 0:
+        improvements.append(
+            f"{rewrite_metrics['fallback_count']} slide(s) used the rule-based fallback because the AI was unavailable"
+        )
+
+    if rewrite_metrics.get('consistency_fixes', 0) > 0:
+        improvements.append(
+            f"{rewrite_metrics['consistency_fixes']} inconsistent spelling correction(s) were unified across slides"
+        )
+
+    if analysis_ok and final_assessment:
         overall = final_assessment.get('overall_score', 0)
         original = final_assessment.get('original_score', 0)
         if overall > original:
-            improvements.append(
-                f"Overall score improved from {original}/100 to {overall}/100"
-            )
+            improvements.append(f'Overall score improved from {original}/100 to {overall}/100')
+        # Grammar/Spelling/Conciseness "addressed" lines were removed here:
+        # they used to fire from a category SCORE THRESHOLD (e.g. Spelling
+        # < 90) regardless of whether that category's text was actually
+        # touched by the rewrite — a fabricated tick. Restore only once
+        # final_validator exposes a real per-category before/after delta
+        # to check against (e.g. final_assessment['category_deltas']).
 
-    categories = quality_scores.get('category_scores', {})
-    if categories.get('Grammar', 100) < 90:
-        improvements.append('Sentences restructured for correct grammar and natural flow')
-    if categories.get('Spelling', 100) < 90:
-        improvements.append('Spelling and punctuation corrected throughout')
-    if categories.get('Readability', 100) < 85:
-        improvements.append('Readability enhanced — shorter sentences, clearer word choice')
-    if categories.get('Tone', 100) < 85:
-        improvements.append('Professional tone strengthened — conference-ready language')
-    if categories.get('Clarity', 100) < 85:
-        improvements.append('Clarity improved — each bullet now conveys one clear idea')
-    if categories.get('Conciseness', 100) < 85:
-        improvements.append('Text condensed — filler words and repetition removed')
-    if categories.get('Structure', 100) < 85:
-        improvements.append('Slide structure tightened — logical hierarchy and parallel bullets')
-
-    return improvements or [
-        'Professional tone and presentation-friendly language applied',
-        'Bullet points tightened for scannability and parallel structure',
-        'All 7 Cs of Communication optimised for maximum impact',
-        'Filler phrases and weak wording eliminated',
-    ]
+    return improvements

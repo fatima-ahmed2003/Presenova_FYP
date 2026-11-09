@@ -1,11 +1,11 @@
 """
 Phase Five: AI Coach / Practice Mode Blueprint
-Role: Provide real-time AI coaching using Gemini for short, context-aware responses.
+Role: Provide real-time AI coaching as a live practice partner.
 
 Key Features:
-- Gemini-powered coaching (short, concise, contextual replies — max ~100 words)
-- Graceful fallback to local TF-IDF + LogisticRegression if Gemini unavailable
-- Presenova AI Coach persona
+- Gemini-powered coaching (short replies, one question per turn)
+- Groq as backup LLM when Gemini is busy (503) or unavailable
+- Honest "AI busy" message instead of fake canned answers
 - Grammar analysis via LanguageTool pre-pass
 - Context injection from document/speech analysis reports
 """
@@ -36,7 +36,12 @@ phase_five_bp = Blueprint('phase_five', __name__, url_prefix='/api')
 def _build_context_text(context_report: dict) -> str:
     """Turn analysis report dict into a compact plain-text summary for the prompt."""
     if not context_report:
-        return "No analysis report provided."
+        return "No analysis report loaded (free practice session). Do not invent scores or metrics."
+
+    # Frontend sends a placeholder report when no real analysis exists.
+    # Do not let the AI treat placeholder numbers as real.
+    if context_report.get('phase') == 'practice' and not context_report.get('v1Analysis'):
+        return "No analysis report loaded (free practice session). Do not invent scores or metrics."
 
     parts = []
     phase = context_report.get('phase', 'practice')
@@ -82,64 +87,65 @@ def _build_context_text(context_report: dict) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# Gemini-powered coach response
+# Coach persona + prompt
 # ─────────────────────────────────────────────────────────────
-def _gemini_coach_response(
-    message: str,
-    context_text: str,
-    grammar_context: str,
-    history: list,
-) -> str:
-    """
-    Call Gemini to get a SHORT, CONTEXT-AWARE coaching reply.
-    Returns '' if Gemini is unavailable so the caller can fall back to local engine.
-    """
+COACH_SYSTEM = (
+    "You are Presenova AI Coach, a live presentation practice partner for students (FYP/viva/class talks). "
+    "Rules: "
+    "1) Reply in the language the student writes in (English, Roman Urdu or Hindi). "
+    "2) Keep it under 80 words. "
+    "3) End EVERY reply with exactly ONE short question or task that moves the practice forward. "
+    "4) If the student wants to practice but has not given details, ask for the topic first, then audience, "
+    "then time limit (one question at a time). "
+    "5) Once the topic is known, ask them to type their opening 30 seconds, then give specific feedback on "
+    "hook, structure, clarity and pacing, then ask for the next part. "
+    "6) If a real analysis report is provided, use its scores and weaknesses. If not, never invent scores. "
+    "7) Never repeat a greeting and never give generic advice unrelated to what the student just said."
+)
+
+
+def _build_prompt(message: str, context_text: str, grammar_context: str, history: list) -> str:
+    recent = history[-8:] if history else []
+    lines = []
+    for m in recent:
+        role = 'Student' if m.get('role') == 'user' else 'Coach'
+        lines.append(f"{role}: {str(m.get('content', ''))[:400]}")
+    history_text = '\n'.join(lines) if lines else '(No previous turns)'
+
+    return f"""PRESENTATION CONTEXT:
+{context_text}
+{grammar_context}
+
+CONVERSATION SO FAR:
+{history_text}
+
+STUDENT SAYS: {message}
+
+Reply as Presenova AI Coach, following your rules."""
+
+
+# ─────────────────────────────────────────────────────────────
+# Gemini (primary)
+# ─────────────────────────────────────────────────────────────
+def _gemini_coach_response(prompt: str) -> str:
+    """Returns '' if Gemini is unavailable or gives an empty answer."""
     try:
         from services.ai.gemini_provider import GeminiProvider
         provider = GeminiProvider()
         if not provider.is_available():
-            logger.info("[AI COACH] Gemini not available, will use local fallback.")
+            logger.warning("[AI COACH] Gemini provider not available.")
             return ''
-
-        # Build a brief conversation history string (last 4 turns)
-        history_text = ''
-        recent = history[-4:] if len(history) > 4 else history
-        if recent:
-            lines = []
-            for msg in recent:
-                role = 'User' if msg.get('role') == 'user' else 'Coach'
-                content = str(msg.get('content', ''))[:120]
-                lines.append(f"{role}: {content}")
-            history_text = '\n'.join(lines)
-
-        system_instruction = (
-            "You are Presenova AI Coach, an elite AI Presentation and Communication Coach. "
-            "Respond directly, conversationally, and concisely — strictly under 75 words (2-4 sentences or 2 bullet points). "
-            "If the user asks about an external or technical topic (e.g. ethical hacking, AI, engineering, career), "
-            "give a brief direct answer or actionable tip, then naturally tie it back to presentation skills, viva defense, "
-            "or explaining complex concepts to an audience. "
-            "NEVER repeat a generic welcome greeting if the user asks a specific question. "
-            "Always be specific, encouraging, and concise."
-        )
-
-        prompt = f"""PRESENTATION ANALYSIS CONTEXT:
-{context_text}
-{grammar_context}
-
-RECENT CONVERSATION:
-{history_text if history_text else "(No previous turns)"}
-
-USER SAYS: {message}
-
-Respond as Presenova AI Coach — short, direct, context-aware (under 75 words)."""
 
         response = provider.generate(
             prompt=prompt,
             temperature=0.7,
-            max_output_tokens=350,
-            system_instruction=system_instruction,
+            max_output_tokens=1024,
+            system_instruction=COACH_SYSTEM,
         )
-        return response.strip() if response else ''
+        if not response or not response.strip():
+            logger.warning("[AI COACH] Gemini returned an empty response (model=%s)", provider.model_name)
+            return ''
+        return response.strip()
 
     except Exception as exc:
         logger.warning("[AI COACH] Gemini call failed: %s", exc)
@@ -147,7 +153,41 @@ Respond as Presenova AI Coach — short, direct, context-aware (under 75 words).
 
 
 # ─────────────────────────────────────────────────────────────
-# Local fallback (TF-IDF intent engine)
+# Groq (backup)
+# ─────────────────────────────────────────────────────────────
+def _groq_coach_response(prompt: str) -> str:
+    """Backup LLM when Gemini is busy/unavailable. Needs GROQ_API_KEY and GROQ_CHAT_MODEL in .env."""
+    try:
+        key = os.getenv('GROQ_API_KEY', '').strip()
+        if not key:
+            logger.warning("[AI COACH] GROQ_API_KEY missing; Groq backup skipped.")
+            return ''
+        model = os.getenv('GROQ_CHAT_MODEL', '').strip()
+        if not model:
+            logger.warning("[AI COACH] GROQ_CHAT_MODEL not set in .env; Groq backup skipped.")
+            return ''
+
+        from groq import Groq
+        client = Groq(api_key=key, timeout=20.0)
+        r = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": COACH_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7,
+            max_tokens=400,
+        )
+        return (r.choices[0].message.content or '').strip()
+
+    except Exception as exc:
+        logger.warning("[AI COACH] Groq call failed: %s", exc)
+        return ''
+
+
+# ─────────────────────────────────────────────────────────────
+# Local fallback (TF-IDF intent engine) - kept for reference, no longer used
+# by the endpoint so that students never see fake canned answers.
 # ─────────────────────────────────────────────────────────────
 def _local_fallback_response(message: str, context_report: dict, has_history: bool = False) -> str:
     """Use local intent classification engine when Gemini is unavailable."""
@@ -159,7 +199,6 @@ def _local_fallback_response(message: str, context_report: dict, has_history: bo
             session_context=context_report,
         )
         resp = result.get("response", "")
-        # If user asked a specific question during an active conversation, do not repeat the canned greeting
         if has_history and ("Dr. Alexander Vance" in resp or "Presenova AI Coach" in resp or "Hello! I am" in resp):
             return (
                 f"Regarding '{message[:60]}': focus on explaining this clearly with structured examples. "
@@ -192,13 +231,9 @@ def practice_chat():
     Response:
       {
         "status": "success",
-        "ai_response": "Coach reply (short, context-aware)",
-        "powered_by": "gemini" | "local" | "fallback",
-        "grammar_score": 95,
-        "grammar_issues": [...],
-        "grammar_issues_count": 0,
-        "message_id": "msg_...",
-        "timestamp": "..."
+        "ai_response": "Coach reply",
+        "powered_by": "gemini" | "groq" | "unavailable",
+        ...
       }
     """
     try:
@@ -234,34 +269,31 @@ def practice_chat():
                 if grammar_issues:
                     grammar_context = (
                         f"\nGRAMMAR NOTE ({len(grammar_issues)} issue(s), score {grammar_score_val}/100): "
-                        f"{grammar_summary} — briefly mention the fix in your reply."
+                        f"{grammar_summary} - briefly mention the fix in your reply."
                     )
                     logger.info("[AI COACH] %d grammar issue(s) found.", len(grammar_issues))
         except Exception as _ge:
             logger.warning("[AI COACH] Grammar pre-pass failed: %s", _ge)
 
-        # ── 3. Build analysis context ─────────────────────────────────────────
+        # ── 3. Build analysis context + prompt ────────────────────────────────
         context_text = _build_context_text(context_report)
+        coach_prompt = _build_prompt(message, context_text, grammar_context, history)
 
-        # ── 4. Try Gemini first ───────────────────────────────────────────────
-        ai_response_text = _gemini_coach_response(message, context_text, grammar_context, history)
+        # ── 4. Gemini first, Groq as backup ───────────────────────────────────
+        ai_response_text = _gemini_coach_response(coach_prompt)
         powered_by = "gemini"
 
-        # ── 5. Fall back to local engine if Gemini unavailable ────────────────
         if not ai_response_text:
-            logger.info("[AI COACH] Using local intent engine as fallback.")
-            ai_response_text = _local_fallback_response(message, context_report, has_history=bool(history))
-            powered_by = "local"
+            logger.info("[AI COACH] Gemini gave no answer, trying Groq.")
+            ai_response_text = _groq_coach_response(coach_prompt)
+            powered_by = "groq"
 
-        # ── 6. Last-resort hardcoded reply ────────────────────────────────────
+        # ── 5. Honest message instead of a fake canned answer ─────────────────
         if not ai_response_text:
-            ai_response_text = (
-                "Keep practicing! Focus on clear pacing (130–150 WPM), "
-                "eliminate filler words, and keep each slide to 6 bullets max."
-            )
-            powered_by = "fallback"
+            ai_response_text = "The AI coach is busy right now. Please send your message again in a few seconds."
+            powered_by = "unavailable"
 
-        # ── 7. Return response ────────────────────────────────────────────────
+        # ── 6. Return response ────────────────────────────────────────────────
         logger.info("[AI COACH] Response ready. powered_by=%s", powered_by)
         return jsonify({
             "success": True,
