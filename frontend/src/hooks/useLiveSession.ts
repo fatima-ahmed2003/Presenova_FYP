@@ -13,6 +13,8 @@ export interface RealtimeFeedback {
   hint: string;
   confidence: number | null;
   emotion: string;
+  facialBlendshapes: Record<string, number> | null;
+  metricConfidence: { eyeContact: number | null; posture: number | null; headMovement: number | null };
 }
 
 export interface UseLiveSessionProps {
@@ -38,6 +40,8 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
     hint: 'Preparing session...',
     confidence: null,
     emotion: 'N/A',
+    facialBlendshapes: null,
+    metricConfidence: { eyeContact: null, posture: null, headMovement: null },
   });
   const [micActive, setMicActive] = useState(false);
   const [micEnabled, setMicEnabled] = useState(true);
@@ -63,6 +67,8 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
       hint,
       confidence: null,
       emotion: 'N/A',
+      facialBlendshapes: null,
+      metricConfidence: { eyeContact: null, posture: null, headMovement: null },
     });
   };
 
@@ -70,6 +76,10 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
   const sessionIdRef = useRef<string | null>(null);
   const isFinishingRef = useRef(false);
   const videoIntervalRef = useRef<any>(null);
+  const videoFrameInFlightRef = useRef<number | null>(null);
+  const videoFrameAckTimerRef = useRef<any>(null);
+  const videoAckSupportedRef = useRef<boolean | null>(null);
+  const lastFeedbackFrameRef = useRef(0);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioIntervalRef = useRef<any>(null);
   const audioStreamRef = useRef<MediaStream | null>(null);
@@ -122,6 +132,20 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
     });
 
     socket.on('realtime_feedback', (data: any) => {
+      if (typeof data.frame_id === 'number') {
+        if (data.frame_id < lastFeedbackFrameRef.current) return;
+        lastFeedbackFrameRef.current = data.frame_id;
+        if (performance.now() - data.frame_id > 2000) {
+          clearVisualFeedback('Visual analysis is delayed; waiting for a current frame.');
+          return;
+        }
+      }
+      const blendshapeData = data.facial_blendshapes && typeof data.facial_blendshapes === 'object'
+        ? Object.fromEntries(Object.entries(data.facial_blendshapes).filter((entry): entry is [string, number] =>
+          typeof entry[1] === 'number' && Number.isFinite(entry[1])
+        ))
+        : null;
+      const confidenceData = data.metric_confidence || {};
       setRealtimeFeedback({
         eyeContact: typeof data.eye_contact === 'number' ? data.eye_contact : null,
         posture: typeof data.posture === 'number' ? data.posture : null,
@@ -133,6 +157,12 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
         hint: data.hint || 'Face not detected. Waiting for a valid frame.',
         confidence: typeof data.confidence === 'number' ? data.confidence : null,
         emotion: data.emotion || 'N/A',
+        facialBlendshapes: blendshapeData && Object.keys(blendshapeData).length ? blendshapeData : null,
+        metricConfidence: {
+          eyeContact: typeof confidenceData.eye_contact === 'number' ? confidenceData.eye_contact : null,
+          posture: typeof confidenceData.posture === 'number' ? confidenceData.posture : null,
+          headMovement: typeof confidenceData.head_movement === 'number' ? confidenceData.head_movement : null,
+        },
       });
     });
 
@@ -150,6 +180,9 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
 
     socket.on('disconnect', (reason: string) => {
       console.log('Socket disconnected:', reason);
+      videoFrameInFlightRef.current = null;
+      videoAckSupportedRef.current = null;
+      if (videoFrameAckTimerRef.current) clearTimeout(videoFrameAckTimerRef.current);
       if (statusRef.current === 'CONNECTING' || statusRef.current === 'STREAMING' || statusRef.current === 'INTERRUPTED_Q&A') {
         setError('Lost real-time connection to the live coach server. Reconnecting...');
         if (statusRef.current === 'CONNECTING') setStatus('IDLE');
@@ -173,6 +206,10 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
     setFinalReport(null);
     setSessionId(null);
     sessionIdRef.current = null;
+    videoFrameInFlightRef.current = null;
+    videoAckSupportedRef.current = null;
+    if (videoFrameAckTimerRef.current) clearTimeout(videoFrameAckTimerRef.current);
+    lastFeedbackFrameRef.current = 0;
     isFinishingRef.current = false;
     clearVisualFeedback('Preparing session...');
     setStatus('CONNECTING');
@@ -244,6 +281,11 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
       clearInterval(videoIntervalRef.current);
       videoIntervalRef.current = null;
     }
+    videoFrameInFlightRef.current = null;
+    if (videoFrameAckTimerRef.current) {
+      clearTimeout(videoFrameAckTimerRef.current);
+      videoFrameAckTimerRef.current = null;
+    }
     if (audioIntervalRef.current) {
       clearInterval(audioIntervalRef.current);
       audioIntervalRef.current = null;
@@ -277,7 +319,7 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
 
     const sessionActive = status === 'STREAMING' || status === 'INTERRUPTED_Q&A';
     if (sessionActive && sessionId && videoRef.current) {
-      // 1. Setup Canvas for Video Frame Capture (3fps to avoid network clog)
+      // Keep at most one frame in flight so slow processing cannot queue stale images.
       const canvas = document.createElement('canvas');
       const ctx = canvas.getContext('2d');
 
@@ -285,17 +327,38 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
         const video = videoRef.current;
         if (video && ctx && socketRef.current && ['STREAMING', 'INTERRUPTED_Q&A'].includes(statusRef.current)) {
           // Guard: Only capture when camera stream is actively delivering frames with valid dimensions
-          if (!video.paused && !video.ended && video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+          const canSendFrame = videoAckSupportedRef.current === false || videoFrameInFlightRef.current === null;
+          if (canSendFrame && !video.paused && !video.ended && video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
             const scale = Math.min(1, 480 / video.videoWidth);
             canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
             canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
             ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
             const frameBase64 = canvas.toDataURL('image/jpeg', 0.7); // 70% quality for clean landmark detection
 
+            const frameId = Math.round(performance.now());
+            const expectsAck = videoAckSupportedRef.current !== false;
+            if (expectsAck) videoFrameInFlightRef.current = frameId;
             socketRef.current.emit('video_frame', {
               session_id: sessionId,
               frame: frameBase64,
+              frame_id: frameId,
+            }, () => {
+              videoAckSupportedRef.current = true;
+              if (videoFrameAckTimerRef.current) clearTimeout(videoFrameAckTimerRef.current);
+              videoFrameAckTimerRef.current = null;
+              if (videoFrameInFlightRef.current === frameId) videoFrameInFlightRef.current = null;
             });
+            if (expectsAck) {
+              videoFrameAckTimerRef.current = window.setTimeout(() => {
+                if (videoFrameInFlightRef.current === frameId) {
+                  // Older deployed servers may not acknowledge video_frame.
+                  // Fall back to the existing server-side drop/backpressure guard.
+                  videoAckSupportedRef.current = false;
+                  videoFrameInFlightRef.current = null;
+                }
+                videoFrameAckTimerRef.current = null;
+              }, 750);
+            }
           }
         }
       }, 200); // 5 frames per second

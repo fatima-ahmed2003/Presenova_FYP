@@ -21,7 +21,7 @@ from services.download_service import (
     validate_upload_size,
 )
 from services.report_generator import load_report_for_pptx
-from services.rewrite_engine import run_analysis_pipeline, run_rewrite_pipeline
+from services.rewrite_engine import NoRewriteChangesError, run_analysis_pipeline, run_rewrite_pipeline
 from services.text_extractor import (
     get_extension,
     is_allowed_for_analysis,
@@ -146,7 +146,14 @@ def submit_presentation():
             '[routes/rewriter] Received %r (%s bytes) [mode=%s, tone=%s].',
             original_filename, os.path.getsize(temporary_path), mode, tone,
         )
-        result = run_rewrite_pipeline(temporary_path, original_filename, mode=mode, tone=tone)
+        progress_key = _get_progress_key(original_filename)
+        set_progress(progress_key, 0, 6, 'Starting presentation rewrite')
+        result = run_rewrite_pipeline(
+            temporary_path, original_filename, mode=mode, tone=tone,
+            progress_callback=lambda index, total, message: set_progress(
+                progress_key, index, total, message
+            ),
+        )
         try:
             cleanup_old_files()
         except Exception:
@@ -175,7 +182,7 @@ def submit_presentation():
             'mode': result.get('mode', mode),
             'tone': result.get('tone', tone),
             'analysis_available': analysis_ok,
-            'message': 'Presentation successfully improved by AI.',
+            'message': 'Presentation rewritten. The summary lists actual text changes.',
         }
 
         # Optional execution metrics (AI vs fallback counts, guard reverts)
@@ -200,36 +207,52 @@ def submit_presentation():
         if result.get('statistics'):
             response['statistics'] = result['statistics']
 
-        # Persist report history only for REAL analyses, so the dashboard does
-        # not fill up with default placeholder scores.
-        if analysis_ok:
-            try:
-                from flask_jwt_extended import get_jwt_identity
-                from models import Report
-                user_id = get_jwt_identity() or 'guest'
-                report_json = {
-                    "overall_score": quality_scores.get('overall_score'),
-                    "topic": original_filename,
-                    "presentation_title": original_filename,
-                    "slides_processed": result.get('slides_processed', 0),
-                    "category_scores": quality_scores.get('category_scores', {}),
-                    "seven_cs_scores": quality_scores.get('seven_cs_scores', {}),
-                    "improvements": response['improvements'],
-                    "mode": mode,
-                    "tone": tone,
-                }
-                Report.create(
-                    report_json=report_json,
-                    report_type='presentation_analysis',
-                    user_id=user_id
-                )
-                logger.info("[routes/rewriter] Saved Report for presentation rewrite (%s) to user %s", original_filename, user_id)
-            except Exception as _re:
-                logger.warning("[routes/rewriter] Could not save Report history: %s", _re)
-        else:
-            logger.info('[routes/rewriter] Skipped saving Report history (analysis unavailable).')
+        # Save one history entry for every successful rewrite. Include scores
+        # only when they came from a real analysis.
+        try:
+            from flask_jwt_extended import get_jwt_identity
+            from models import Report
+            history = result.get('rewrite_history') or {}
+            changes = history.get('changes') or []
+            history_json = {
+                'filename': original_filename,
+                'output_filename': result['output_filename'],
+                'mode': mode,
+                'tone': tone,
+                'date': datetime.now(timezone.utc).isoformat(),
+                'changed_slides': history.get('changed_slide_numbers', []),
+                'total_changes': history.get('total_changes', len(changes)),
+                'slides_processed': result.get('slides_processed', 0),
+                'improvements': response['improvements'],
+                'actual_changes': [
+                    {**change, 'before': str(change.get('before', ''))[:2000],
+                     'after': str(change.get('after', ''))[:2000],
+                     'text_truncated': len(str(change.get('before', ''))) > 2000
+                     or len(str(change.get('after', ''))) > 2000}
+                    for change in changes[:50]
+                ],
+                'changes_truncated': len(changes) > 50,
+            }
+            if analysis_ok:
+                history_json.update({
+                    'overall_score': quality_scores.get('overall_score'),
+                    'topic': original_filename,
+                    'presentation_title': original_filename,
+                    'category_scores': quality_scores.get('category_scores', {}),
+                    'seven_cs_scores': quality_scores.get('seven_cs_scores', {}),
+                })
+            Report.create(
+                report_json=history_json,
+                report_type='presentation_rewrite',
+                user_id=get_jwt_identity() or 'guest',
+            )
+        except Exception as history_error:
+            logger.warning('[routes/rewriter] Could not save rewrite history: %s', history_error)
 
         return jsonify(response), 200
+    except NoRewriteChangesError as exc:
+        logger.info('[routes/rewriter] No validated text changes: %s', exc)
+        return _error(str(exc), 422, 'NoChanges')
     except ValueError as exc:
         logger.warning('[routes/rewriter] Validation error: %s', exc)
         return _error(str(exc), 400)

@@ -12,12 +12,14 @@ Exposes endpoints for:
 import os
 import logging
 import tempfile
+import re
 from flask import Blueprint, request, jsonify, send_from_directory
 from flask_jwt_extended import jwt_required
 from services.rate_limiter import rate_limit
 from services.presentation_generator import (
     generate_presentation_outline,
     build_pptx_from_outline,
+    PresentationGenerationError,
     GENERATED_FOLDER,
     THEMES
 )
@@ -46,6 +48,68 @@ presentation_generator_bp = Blueprint(
     __name__,
     url_prefix='/api/presentation-generator'
 )
+
+_generation_progress: dict[str, dict] = {}
+_PROGRESS_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,80}$')
+
+
+def _progress_key(value) -> str:
+    value = str(value or '').strip()
+    return value if _PROGRESS_ID_RE.fullmatch(value) else ''
+
+
+def _set_progress(job_id: str, percent: int, message: str, error: str = '') -> None:
+    if job_id:
+        _generation_progress[job_id] = {
+            'percent': max(0, min(100, int(percent))),
+            'message': message,
+            'error': error,
+        }
+
+
+def _progress_callback(job_id: str, start: int = 0, end: int = 100):
+    def update(percent: int, message: str):
+        mapped = start + round((end - start) * max(0, min(100, int(percent))) / 100)
+        _set_progress(job_id, mapped, message)
+    return update
+
+
+def _save_generation_history(outline_data: dict, filename: str, theme: str) -> None:
+    try:
+        from flask_jwt_extended import get_jwt_identity
+        from models import Report
+        topic = outline_data.get('topic', 'Presentation')
+        Report.create(
+            report_json={
+                'overall_score': None,
+                'topic': topic,
+                'presentation_title': outline_data.get('presentation_title', topic),
+                'output_filename': filename,
+                'slides_count': len(outline_data.get('slides', [])),
+                'presentation_type': outline_data.get('presentation_type', 'Auto-detect'),
+                'target_audience': outline_data.get('target_audience', ''),
+                'tone': outline_data.get('tone', ''),
+                'theme': theme,
+            },
+            report_type='presentation_generated',
+            user_id=get_jwt_identity() or 'guest',
+        )
+    except Exception as exc:
+        logger.warning('[presentation_generator_bp] Could not save generation history: %s', exc)
+
+
+@presentation_generator_bp.route('/progress/<job_id>', methods=['GET'])
+@jwt_required(optional=True)
+def get_generation_progress(job_id: str):
+    job_id = _progress_key(job_id)
+    progress = _generation_progress.get(job_id) if job_id else None
+    if progress is None:
+        return jsonify({'success': False, 'error': 'NotFound', 'message': 'Generation progress is not available.'}), 404
+    return jsonify({
+        'success': True,
+        **progress,
+        'done': progress['percent'] >= 100 or bool(progress.get('error')),
+    }), 200
 
 
 @presentation_generator_bp.route('/themes', methods=['GET'])
@@ -87,13 +151,19 @@ def generate_outline_endpoint():
         slide_count = _safe_int(data.get('slide_count'), default=5)
         tone = data.get('tone', 'Professional').strip()
         audience = data.get('target_audience', 'General Audience').strip()
+        presentation_type = data.get('presentation_type', 'Auto-detect').strip() or 'Auto-detect'
+        progress_id = _progress_key(data.get('progress_id'))
+        _set_progress(progress_id, 5, 'Preparing the requested outline')
 
         outline_data = generate_presentation_outline(
             topic=topic,
             slide_count=slide_count,
             tone=tone,
-            audience=audience
+            audience=audience,
+            presentation_type=presentation_type,
+            progress_callback=_progress_callback(progress_id, 5, 95),
         )
+        _set_progress(progress_id, 100, 'Outline ready for review')
 
         return jsonify({
             'success': True,
@@ -101,6 +171,10 @@ def generate_outline_endpoint():
             'outline': outline_data
         }), 200
 
+    except PresentationGenerationError as e:
+        progress_id = _progress_key((request.get_json(silent=True) or {}).get('progress_id'))
+        _set_progress(progress_id, 100, str(e), e.code)
+        return jsonify({'success': False, 'error': e.code, 'message': str(e)}), e.status_code
     except Exception as e:
         logger.error("[presentation_generator_bp] Outline generation failed: %s", e, exc_info=True)
         _is_prod = os.getenv('FLASK_ENV', 'development').strip().lower() == 'production'
@@ -130,6 +204,9 @@ def import_seed_document():
         slide_count = _safe_int(request.form.get('slide_count'), default=6)
         tone = request.form.get('tone', 'Professional')
         audience = request.form.get('target_audience', 'General Audience')
+        presentation_type = request.form.get('presentation_type', 'Auto-detect') or 'Auto-detect'
+        progress_id = _progress_key(request.form.get('progress_id'))
+        _set_progress(progress_id, 5, 'Reading the uploaded source document')
 
         with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
             uploaded_file.save(tmp.name)
@@ -155,8 +232,11 @@ def import_seed_document():
             slide_count=slide_count,
             tone=tone,
             audience=audience,
-            seed_text=extracted_text[:2500]
+            seed_text=extracted_text[:6000],
+            presentation_type=presentation_type,
+            progress_callback=_progress_callback(progress_id, 25, 95),
         )
+        _set_progress(progress_id, 100, 'Source-based outline ready')
 
         return jsonify({
             'success': True,
@@ -165,6 +245,10 @@ def import_seed_document():
             'outline': outline_data
         }), 200
 
+    except PresentationGenerationError as e:
+        progress_id = _progress_key(request.form.get('progress_id'))
+        _set_progress(progress_id, 100, str(e), e.code)
+        return jsonify({'success': False, 'error': e.code, 'message': str(e)}), e.status_code
     except Exception as e:
         logger.error("[presentation_generator_bp] Seed import failed: %s", e, exc_info=True)
         _is_prod = os.getenv('FLASK_ENV', 'development').strip().lower() == 'production'
@@ -196,32 +280,18 @@ def generate_from_outline_endpoint():
 
         theme = data.get('theme', 'modern_dark').strip()
         custom_overrides = data.get('custom_overrides', {})
+        progress_id = _progress_key(data.get('progress_id'))
+        _set_progress(progress_id, 5, 'Preparing the selected theme')
 
         filepath = build_pptx_from_outline(
             outline_data=outline_data,
             theme_name=theme,
-            custom_overrides=custom_overrides
+            custom_overrides=custom_overrides,
+            progress_callback=_progress_callback(progress_id, 5, 95),
         )
         filename = os.path.basename(filepath)
-
-        # Save to user report history
-        try:
-            from flask_jwt_extended import get_jwt_identity
-            from models import Report
-            user_id = get_jwt_identity() or 'guest'
-            topic = outline_data.get('topic', 'Presentation')
-            report_json = {
-                "overall_score": None,  # FIX-D: No fake scores — this is generated, not evaluated
-                "topic": topic,
-                "presentation_title": outline_data.get('presentation_title', topic),
-                "slides_count": len(outline_data.get('slides', [])),
-                "theme": theme,
-                "report_type": "presentation_generated",
-                # seven_cs_scores intentionally omitted — generated presentations have no 7Cs evaluation
-            }
-            Report.create(report_json=report_json, report_type='presentation_generated', user_id=user_id)
-        except Exception:
-            pass
+        _save_generation_history(outline_data, filename, theme)
+        _set_progress(progress_id, 100, 'Presentation ready to download')
 
         return jsonify({
             'success': True,
@@ -232,6 +302,10 @@ def generate_from_outline_endpoint():
             'theme': theme
         }), 200
 
+    except PresentationGenerationError as e:
+        progress_id = _progress_key((request.get_json(silent=True) or {}).get('progress_id'))
+        _set_progress(progress_id, 100, str(e), e.code)
+        return jsonify({'success': False, 'error': e.code, 'message': str(e)}), e.status_code
     except Exception as e:
         logger.error("[presentation_generator_bp] PPTX synthesis from outline failed: %s", e, exc_info=True)
         _is_prod = os.getenv('FLASK_ENV', 'development').strip().lower() == 'production'
@@ -254,16 +328,26 @@ def generate_presentation():
         tone = data.get('tone', 'Professional').strip()
         theme = data.get('theme', 'modern_dark').strip()
         audience = data.get('target_audience', 'General Audience').strip()
+        presentation_type = data.get('presentation_type', 'Auto-detect').strip() or 'Auto-detect'
+        progress_id = _progress_key(data.get('progress_id'))
+        _set_progress(progress_id, 5, 'Preparing your presentation request')
 
         outline_data = generate_presentation_outline(
             topic=topic,
             slide_count=slide_count,
             tone=tone,
-            audience=audience
+            audience=audience,
+            presentation_type=presentation_type,
+            progress_callback=_progress_callback(progress_id, 5, 45),
         )
 
-        filepath = build_pptx_from_outline(outline_data, theme_name=theme)
+        filepath = build_pptx_from_outline(
+            outline_data, theme_name=theme,
+            progress_callback=_progress_callback(progress_id, 45, 95),
+        )
         filename = os.path.basename(filepath)
+        _save_generation_history(outline_data, filename, theme)
+        _set_progress(progress_id, 100, 'Presentation ready to download')
 
         return jsonify({
             'success': True,
@@ -275,6 +359,10 @@ def generate_presentation():
             'theme': theme
         }), 200
 
+    except PresentationGenerationError as e:
+        progress_id = _progress_key((request.get_json(silent=True) or {}).get('progress_id'))
+        _set_progress(progress_id, 100, str(e), e.code)
+        return jsonify({'success': False, 'error': e.code, 'message': str(e)}), e.status_code
     except Exception as e:
         logger.error("[presentation_generator_bp] Generation failed: %s", e, exc_info=True)
         _is_prod = os.getenv('FLASK_ENV', 'development').strip().lower() == 'production'

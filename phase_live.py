@@ -244,23 +244,31 @@ def _smooth_metric(session, metric, value, confidence):
     return _clip_score(ema), confidence
 
 
-def _smooth_expression(session, expression):
-    if session is None or expression == "N/A":
-        return expression
-    session_id = str(getattr(session, "id", ""))
-    with _head_pose_lock:
-        metrics = _metric_smoothing.setdefault(session_id, {})
-        samples = metrics.setdefault("expression_labels", deque(maxlen=5))
-        samples.append(expression)
-        counts = {label: samples.count(label) for label in set(samples)}
-        return max(counts, key=counts.get)
-
-
 def _smooth_visual_scores(eye_contact_score, posture_score, session):
     return (
         _smooth_metric(session, "gaze", eye_contact_score, None)[0],
         _smooth_metric(session, "posture", posture_score, None)[0],
     )
+
+
+_DISPLAYED_BLENDSHAPES = (
+    "mouthSmileLeft", "mouthSmileRight", "eyeBlinkLeft", "eyeBlinkRight",
+    "browDownLeft", "browDownRight", "jawOpen", "mouthPressLeft",
+    "mouthPressRight",
+)
+
+
+def _measure_facial_blendshapes(blendshapes, session=None):
+    """Return smoothed, measured blendshape coefficients without emotion labels."""
+    values = _blendshape_map(blendshapes)
+    measured = {}
+    for name in _DISPLAYED_BLENDSHAPES:
+        if name not in values or not math.isfinite(values[name]):
+            continue
+        coefficient = max(0.0, min(1.0, values[name]))
+        smoothed, _ = _smooth_metric(session, f"blendshape_{name}", coefficient * 100, None)
+        measured[name] = round(smoothed / 100, 3)
+    return measured or None
 
 
 def _visual_result(
@@ -276,6 +284,7 @@ def _visual_result(
     gaze_calibration_status="unavailable",
     expression="N/A",
     metric_confidence=None,
+    facial_blendshapes=None,
 ):
     eye_contact_score, posture_score = _smooth_visual_scores(
         _clip_score(eye_contact_score) if eye_contact_score is not None else None,
@@ -295,7 +304,7 @@ def _visual_result(
         eye_contact_score=eye_contact_score,
         posture_score=posture_score,
         head_movement_score=head_movement_score,
-    ) if face_detected else None
+    )
 
     return {
         "face_detected": face_detected,
@@ -308,7 +317,8 @@ def _visual_result(
         "confidence_score": confidence_score,
         "emotion": expression,
         "expression": expression,
-        "expression_confidence": metric_confidence.get("expression"),
+        "expression_confidence": None,
+        "facial_blendshapes": facial_blendshapes,
         "metric_confidence": metric_confidence,
         "gaze_method": gaze_method,
         "posture_method": posture_method,
@@ -330,6 +340,7 @@ def _unmeasured_visual_result(hint, gaze_calibration_status="unavailable"):
         "confidence_score": None,
         "metric_confidence": {"eye_contact": None, "posture": None, "head_movement": None, "expression": None},
         "expression": "N/A",
+        "facial_blendshapes": None,
         "face_detection_confidence": None,
         "expression_confidence": None,
         "hint": hint,  # FIX: was missing, so the reason never reached the caller/frontend
@@ -443,22 +454,6 @@ def _blendshape_map(blendshapes):
     return {item.category_name: float(item.score) for item in (blendshapes or [])}
 
 
-def _map_expression(blendshapes):
-    values = _blendshape_map(blendshapes)
-    smile = (values.get('mouthSmileLeft', 0.0) + values.get('mouthSmileRight', 0.0)) / 2
-    tense = max(
-        (values.get('browDownLeft', 0.0) + values.get('browDownRight', 0.0)) / 2,
-        (values.get('mouthPressLeft', 0.0) + values.get('mouthPressRight', 0.0)) / 2,
-        (values.get('noseSneerLeft', 0.0) + values.get('noseSneerRight', 0.0)) / 2,
-        values.get('jawClench', 0.0),
-    )
-    if smile >= 0.25 and smile >= tense:
-        return 'smile', _clip_score(smile * 100)
-    if tense >= 0.25:
-        return 'tense', _clip_score(tense * 100)
-    return 'neutral', _clip_score((1.0 - max(smile, tense)) * 100)
-
-
 def _gaze_ratios(landmarks):
     def p(index):
         return landmarks[index].x, landmarks[index].y
@@ -469,11 +464,21 @@ def _gaze_ratios(landmarks):
     left_iris, right_iris = [p(i) for i in range(468, 473)], [p(i) for i in range(473, 478)]
     left_c = (sum(v[0] for v in left_iris) / 5, sum(v[1] for v in left_iris) / 5)
     right_c = (sum(v[0] for v in right_iris) / 5, sum(v[1] for v in right_iris) / 5)
-    lh = (left_c[0] - min(left_outer[0], left_inner[0])) / max(1e-5, abs(left_inner[0] - left_outer[0]))
-    rh = (right_c[0] - min(right_inner[0], right_outer[0])) / max(1e-5, abs(right_outer[0] - right_inner[0]))
-    lv = (left_c[1] - min(left_top[1], left_bottom[1])) / max(1e-5, abs(left_bottom[1] - left_top[1]))
-    rv = (right_c[1] - min(right_top[1], right_bottom[1])) / max(1e-5, abs(right_bottom[1] - right_top[1]))
-    return (lh + rh) / 2, (lv + rv) / 2
+    left_width = abs(left_inner[0] - left_outer[0])
+    right_width = abs(right_outer[0] - right_inner[0])
+    left_height = abs(left_bottom[1] - left_top[1])
+    right_height = abs(right_bottom[1] - right_top[1])
+    if min(left_width, right_width, left_height, right_height) < 1e-4:
+        return None, None
+    ratios = (
+        (left_c[0] - min(left_outer[0], left_inner[0])) / left_width,
+        (right_c[0] - min(right_inner[0], right_outer[0])) / right_width,
+        (left_c[1] - min(left_top[1], left_bottom[1])) / left_height,
+        (right_c[1] - min(right_top[1], right_bottom[1])) / right_height,
+    )
+    if not all(math.isfinite(value) and -0.15 <= value <= 1.15 for value in ratios):
+        return None, None
+    return (ratios[0] + ratios[1]) / 2, (ratios[2] + ratios[3]) / 2
 
 
 def _next_video_timestamp_ms():
@@ -493,19 +498,34 @@ def _analyze_frame_with_tasks(img, session=None):
         with _vision_lock:
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             face_result = _face_landmarker.detect_for_video(mp_image, timestamp)
-            if not face_result.face_landmarks:
-                return None
-            landmarks = face_result.face_landmarks[0]
-            blendshapes = face_result.face_blendshapes[0] if face_result.face_blendshapes else []
-            matrices = face_result.facial_transformation_matrixes
-            transform = matrices[0] if matrices is not None and len(matrices) else None
             pose_result = _pose_landmarker.detect_for_video(mp_image, timestamp) if _pose_landmarker is not None else None
     except Exception as exc:
         logger.warning('[LIVE WARN] MediaPipe Tasks frame processing failed: %s', exc)
         return None
-    if len(landmarks) < 478:
-        return None
+    pose_landmarks = pose_result.pose_landmarks[0] if pose_result and pose_result.pose_landmarks else None
+    posture, posture_confidence = _estimate_posture_score(pose_landmarks, w, h)
 
+    if not face_result.face_landmarks:
+        return _visual_result(
+            None, posture,
+            'Face not detected; posture is measured only when shoulder and hip landmarks are visible.' if posture is not None else 'Face and posture landmarks are unavailable in this frame.',
+            session=session, face_detected=False,
+            posture_method='mediapipe_tasks_pose' if posture is not None else None,
+            metric_confidence={'posture': posture_confidence if posture is not None else None},
+        )
+
+    landmarks = face_result.face_landmarks[0]
+    if len(landmarks) < 478:
+        return _visual_result(
+            None, posture, 'Face landmarks are incomplete; available posture measurement is retained.',
+            session=session, face_detected=False,
+            posture_method='mediapipe_tasks_pose' if posture is not None else None,
+            metric_confidence={'posture': posture_confidence if posture is not None else None},
+        )
+
+    blendshapes = face_result.face_blendshapes[0] if face_result.face_blendshapes else []
+    matrices = face_result.facial_transformation_matrixes
+    transform = matrices[0] if matrices is not None and len(matrices) else None
     face_height = max(p.y for p in landmarks) - min(p.y for p in landmarks)
     face_visibility = max(0.0, min(1.0, (face_height - 0.08) / 0.35))
     horizontal, vertical = _gaze_ratios(landmarks)
@@ -521,13 +541,7 @@ def _analyze_frame_with_tasks(img, session=None):
     if head_score is not None:
         head_confidence = _clip_score(90 * face_visibility)
 
-    pose_landmarks = pose_result.pose_landmarks[0] if pose_result and pose_result.pose_landmarks else None
-    posture, posture_confidence = _estimate_posture_score(pose_landmarks, w, h)
-
-    expression, expression_confidence = _map_expression(blendshapes) if blendshapes else ('N/A', None)
-    if expression_confidence is not None:
-        expression_confidence = _clip_score(expression_confidence * face_visibility)
-        expression = _smooth_expression(session, expression)
+    facial_blendshapes = _measure_facial_blendshapes(blendshapes, session) if blendshapes else None
     if calibration_status == 'calibrating':
         hint = 'Look toward the camera for gaze calibration to finish.'
     elif posture is None:
@@ -541,12 +555,13 @@ def _analyze_frame_with_tasks(img, session=None):
         gaze_method='mediapipe_tasks_iris_blendshapes' if gaze is not None else None,
         posture_method='mediapipe_tasks_pose' if posture is not None else None,
         head_movement_score=head_score, gaze_calibration_status=calibration_status,
-        expression=expression,
+        expression='N/A',
+        facial_blendshapes=facial_blendshapes,
         metric_confidence={
             'eye_contact': _clip_score(gaze_confidence * face_visibility) if gaze_confidence is not None else None,
             'posture': posture_confidence if posture is not None else None,
             'head_movement': head_confidence if head_score is not None else None,
-            'expression': expression_confidence,
+            'expression': None,
         },
     )
 
@@ -792,13 +807,14 @@ def init_socketio_events(socketio):
         """
         session_id = data.get('session_id')
         frame_data = data.get('frame')
+        frame_id = data.get('frame_id')
         
         if not session_id or not frame_data:
-            return
+            return {'frame_id': frame_id, 'dropped': True}
             
         session = PresentationSession.get_by_id(session_id)
         if not session or session.status not in ('STREAMING', 'INTERRUPTED_Q&A'):
-            return
+            return {'frame_id': frame_id, 'dropped': True}
 
         session.increment_metric("video_frames_received")
 
@@ -808,7 +824,7 @@ def init_socketio_events(socketio):
         with _active_frame_lock:
             if session_id_str in _active_frame_sessions:
                 session.increment_metric("video_frames_dropped")
-                return
+                return {'frame_id': frame_id, 'dropped': True}
             _active_frame_sessions.add(session_id_str)
 
         try:
@@ -822,6 +838,7 @@ def init_socketio_events(socketio):
             posture_score = metrics.get("posture")
             head_movement_score = metrics.get("head_movement")
             confidence_score = metrics.get("confidence")
+            facial_blendshapes = metrics.get("facial_blendshapes")
             if eye_score is not None:
                 session.update_metrics("eye_contact_scores", eye_score)
                 session.increment_metric("video_frames_with_gaze")
@@ -833,8 +850,12 @@ def init_socketio_events(socketio):
                 session.increment_metric("video_frames_with_head_movement")
             if confidence_score is not None:
                 session.update_metrics("confidence_scores", confidence_score)
+            if isinstance(facial_blendshapes, dict) and facial_blendshapes:
+                session.metrics.setdefault("facial_blendshape_samples", [])
+                session.update_metrics("facial_blendshape_samples", facial_blendshapes)
             
             socketio.emit('realtime_feedback', {
+                "frame_id": frame_id,
                 "face_detected": face_detected,
                 "eye_contact": eye_score,
                 "posture": posture_score,
@@ -842,13 +863,19 @@ def init_socketio_events(socketio):
                 "gaze_calibration_status": metrics.get("gaze_calibration_status", "unavailable"),
                 "hint": metrics.get("hint", "No visual metrics were available for this frame."),
                 "confidence": confidence_score,
-                "emotion": metrics.get("expression", "N/A"),
-                "expression": metrics.get("expression", "N/A"),
+                "emotion": "N/A",
+                "expression": "N/A",
+                "facial_blendshapes": facial_blendshapes,
                 "metric_confidence": metrics.get("metric_confidence", {}),
             }, room=request.sid, namespace='/ws/live-session')
+        except Exception as exc:
+            logger.warning('[LIVE WARN] Frame event failed: %s', exc)
+            session.increment_metric("video_frames_dropped")
+            return {'frame_id': frame_id, 'dropped': True}
         finally:
             with _active_frame_lock:
                 _active_frame_sessions.discard(session_id_str)
+        return {'frame_id': frame_id, 'dropped': False}
 
     @socketio.on('audio_chunk', namespace='/ws/live-session')
     def on_audio_chunk(data):
@@ -1068,6 +1095,7 @@ def submit_presentation():
         eye_scores = session.metrics.get("eye_contact_scores", [])
         posture_scores = session.metrics.get("posture_scores", [])
         head_movement_scores = session.metrics.get("head_movement_scores", [])
+        facial_blendshape_samples = session.metrics.get("facial_blendshape_samples", [])
         wpm_history = session.metrics.get("wpm_history", [])
         fillers = session.metrics.get("fillers_detected", 0)
         interruptions = session.metrics.get("interruptions", [])
@@ -1084,6 +1112,22 @@ def submit_presentation():
         avg_head_movement = avg_or_zero(head_movement_scores)
         avg_wpm = avg_or_zero(wpm_history) if wpm_history else None
         avg_confidence = avg_or_zero(confidence_scores)
+        has_enough_blendshapes = len(facial_blendshape_samples) >= MIN_VALID_VIDEO_SAMPLES
+        avg_facial_blendshapes = None
+        if has_enough_blendshapes:
+            blendshape_totals = {}
+            blendshape_counts = {}
+            for sample in facial_blendshape_samples:
+                if not isinstance(sample, dict):
+                    continue
+                for name, coefficient in sample.items():
+                    if isinstance(coefficient, (int, float)) and math.isfinite(coefficient):
+                        blendshape_totals[name] = blendshape_totals.get(name, 0.0) + coefficient
+                        blendshape_counts[name] = blendshape_counts.get(name, 0) + 1
+            avg_facial_blendshapes = {
+                name: round(blendshape_totals[name] * 100 / count, 1)
+                for name, count in blendshape_counts.items() if count
+            } or None
 
         qna_scores = [i["score"] for i in interruptions if i.get("score") is not None]
         avg_qna = avg_or_zero(qna_scores)
@@ -1315,6 +1359,7 @@ def submit_presentation():
             "avg_eye_contact": avg_eye if has_enough_gaze else None,
             "avg_posture": avg_posture if has_enough_posture else None,
             "avg_head_movement": avg_head_movement if has_enough_head_movement else None,
+            "avg_facial_blendshapes": avg_facial_blendshapes,
             "avg_wpm": avg_wpm if has_enough_audio else None,
             "total_fillers": fillers if has_enough_audio else None,
             "interruptions_handled": len(interruptions),
@@ -1329,6 +1374,8 @@ def submit_presentation():
                 "video_frames_with_gaze": video_frames_with_gaze,
                 "video_frames_with_posture": video_frames_with_posture,
                 "head_movement_samples": len(head_movement_scores),
+                "facial_blendshape_samples": len(facial_blendshape_samples),
+                "has_facial_blendshape_metrics": has_enough_blendshapes,
                 "valid_frame_coverage": valid_frame_coverage,
                 "gaze_frame_coverage": gaze_frame_coverage,
                 "posture_frame_coverage": posture_frame_coverage,

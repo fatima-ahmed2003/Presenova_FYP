@@ -10,6 +10,16 @@ export interface PresentationGenRequest {
   tone?: string;
   theme?: string;
   target_audience?: string;
+  presentation_type?: string;
+  progress_id?: string;
+}
+
+export interface GeneratorProgressResponse {
+  success: boolean;
+  percent: number;
+  message: string;
+  done: boolean;
+  error?: string;
 }
 
 export interface SlideCardItem {
@@ -116,13 +126,15 @@ export async function generateOutline(
 
 export async function importSeedFile(
   file: File,
-  options?: { slide_count?: number; tone?: string; target_audience?: string }
+  options?: { slide_count?: number; tone?: string; target_audience?: string; presentation_type?: string; progress_id?: string }
 ): Promise<SeedImportResponse> {
   const formData = new FormData();
   formData.append('file', file);
   if (options?.slide_count) formData.append('slide_count', String(options.slide_count));
   if (options?.tone) formData.append('tone', options.tone);
   if (options?.target_audience) formData.append('target_audience', options.target_audience);
+  if (options?.presentation_type) formData.append('presentation_type', options.presentation_type);
+  if (options?.progress_id) formData.append('progress_id', options.progress_id);
 
   const response = await fetchWithAuth(`${API_BASE_URL}/presentation-generator/import-seed`, {
     method: 'POST',
@@ -140,6 +152,7 @@ export async function importSeedFile(
 export async function generateFromOutline(payload: {
   outline: PresentationOutline;
   theme: string;
+  progress_id?: string;
   custom_overrides?: {
     show_slide_numbers?: boolean;
     confidentiality_tag?: string;
@@ -176,4 +189,13 @@ export async function generatePresentation(
 
 export function getGeneratorDownloadUrl(filename: string): string {
   return `${API_BASE_URL}/presentation-generator/download/${encodeURIComponent(filename)}`;
+}
+
+export async function pollGeneratorProgress(progressId: string): Promise<GeneratorProgressResponse> {
+  const response = await fetchWithAuth(
+    `${API_BASE_URL}/presentation-generator/progress/${encodeURIComponent(progressId)}`,
+  );
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.message || 'Could not retrieve generation progress.');
+  return data as GeneratorProgressResponse;
 }

@@ -256,7 +256,7 @@
 /* ── Mode & Tone Config ──────────────────────────────────────────── */
 .pr-config-row {
   display: grid;
-  grid-template-columns: 1.5fr 1fr;
+  grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr);
   gap: 1rem;
   margin-top: 1.25rem;
 }
@@ -310,7 +310,10 @@
 .pr-config-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .pr-config-select {
+  display: block;
   width: 100%;
+  min-width: 0;
+  max-width: 100%;
   padding: 0.62rem 2rem 0.62rem 0.8rem;
   border-radius: 10px;
   border: 1px solid rgba(255, 255, 255, 0.09);
@@ -1067,4 +1070,11 @@
   .pr-stats-grid { grid-template-columns: 1fr 1fr; }
   .pr-overall-row { flex-direction: column; align-items: flex-start; }
   .pr-score-bar-row { grid-template-columns: 90px 1fr 32px; }
+}
+
+@media (max-width: 420px) {
+  .pr-config-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .pr-config-btn { min-width: 0; white-space: normal; }
+  .pr-config-select { font-size: 0.76rem; padding-left: 0.65rem; }
+  .pr-step-desc { line-height: 1.35; }
 }

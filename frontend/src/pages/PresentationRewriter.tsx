@@ -330,6 +330,7 @@ const StatisticsPanel: React.FC<{ stats: PresentationStatistics }> = ({ stats })
 const PresentationRewriter: React.FC = () => {
   const [stage, setStage]       = useState<Stage>('idle');
   const [currentStep, setStep]  = useState(0);
+  const [progressMessage, setProgressMessage] = useState('');
   const [selectedFile, setFile] = useState<File | null>(null);
   const [isDragging, setDragging] = useState(false);
   const [result, setResult]     = useState<PresentationRewriterResponse | null>(null);
@@ -360,11 +361,11 @@ const PresentationRewriter: React.FC = () => {
     // PDF_DISABLED: if (ext !== 'pptx' && ext !== 'pdf') { setError('Supported formats are .pptx for rewriting and .pdf/.pptx for analysis.'); return; }
     if (ext !== 'pptx') { setError('Only .pptx files are supported.'); return; }
     if (f.size > MAX_PRESENTATION_UPLOAD_BYTES) { setError('File too large. Maximum allowed size is 50 MB.'); return; }
-    setFile(f); setResult(null); setAnalysisResult(null); setSlideReport(null); setShowComparison(false); setError(null); setStage('idle'); setStep(0);
+    setFile(f); setResult(null); setAnalysisResult(null); setSlideReport(null); setShowComparison(false); setError(null); setStage('idle'); setStep(0); setProgressMessage('');
   };
 
   const reset = () => {
-    setFile(null); setResult(null); setAnalysisResult(null); setSlideReport(null); setShowComparison(false); setError(null); setStage('idle'); setStep(0);
+    setFile(null); setResult(null); setAnalysisResult(null); setSlideReport(null); setShowComparison(false); setError(null); setStage('idle'); setStep(0); setProgressMessage('');
     if (progressIntervalRef.current) { window.clearInterval(progressIntervalRef.current); progressIntervalRef.current = null; }
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
@@ -375,6 +376,7 @@ const PresentationRewriter: React.FC = () => {
       try {
         const p = await pollProgress(filename);
         setStep(Math.max(1, Math.min(5, Math.ceil((p.percent / 100) * 5))));
+        setProgressMessage(p.message || 'Processing presentation');
         if (p.done && progressIntervalRef.current) { window.clearInterval(progressIntervalRef.current); progressIntervalRef.current = null; }
       } catch { /* ignore */ }
     }, 800);
@@ -382,12 +384,13 @@ const PresentationRewriter: React.FC = () => {
 
   const handleSubmit = async () => {
     if (!selectedFile || !selectedFile.name.toLowerCase().endsWith('.pptx')) { setError('Select a .pptx file to rewrite.'); return; }
-    setStage('processing'); setStep(1); setError(null); setResult(null); setSlideReport(null); setShowComparison(false);
+    setStage('processing'); setStep(1); setProgressMessage('Starting presentation rewrite'); setError(null); setResult(null); setSlideReport(null); setShowComparison(false);
+    startProgressPolling(selectedFile.name);
     try {
       const response = await rewritePresentation(selectedFile, processingMode, writingTone);
       setResult(response); setStep(5); setStage('complete');
-      startProgressPolling(response.output_filename);
     } catch (err: any) { setError(err.message || 'An error occurred.'); setStage('error'); setStep(0); }
+    finally { if (progressIntervalRef.current) { window.clearInterval(progressIntervalRef.current); progressIntervalRef.current = null; } }
   };
 
   const handleAnalyze = async () => {
@@ -512,7 +515,7 @@ const PresentationRewriter: React.FC = () => {
                         <div className="pr-step-circle">{done ? '✓' : active ? <span className="pr-step-spinner" /> : step.id}</div>
                         <div className="pr-step-info">
                           <span className="pr-step-label">{step.icon} {step.label}</span>
-                          {active && <span className="pr-step-desc">{step.desc}…</span>}
+                          {active && <span className="pr-step-desc">{progressMessage || `${step.desc}…`}</span>}
                         </div>
                       </div>
                       {idx < STEPS.length - 1 && <div className={`pr-step-connector ${done ? 'done' : ''}`} />}
@@ -538,7 +541,7 @@ const PresentationRewriter: React.FC = () => {
                 </ul>
               )}
               <div className="pr-download-actions">
-                <a id="pr-download-btn" className="pr-btn pr-btn-download" href={getDownloadUrl(result.download_url)} target="_blank" rel="noreferrer" download><span>⬇️</span> Download Improved PPTX</a>
+                <a id="pr-download-btn" className="pr-btn pr-btn-download" href={getDownloadUrl(result.download_url)} download><span>⬇️</span> Download Improved PPTX</a>
                 <button id="pr-compare-btn" className="pr-btn pr-btn-secondary" onClick={handleLoadSlideReport} disabled={loadingReport}>
                   {loadingReport ? <><span className="pr-spinner-sm" /> Loading…</> : <><span>📋</span> Compare Changes</>}
                 </button>

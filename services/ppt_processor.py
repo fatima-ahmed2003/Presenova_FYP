@@ -6,6 +6,7 @@ place. It never rebuilds slides or copies visual objects into a new deck.
 
 import logging
 import os
+import re
 import tempfile
 import hashlib
 from io import BytesIO
@@ -209,15 +210,36 @@ def _set_paragraph_text_preserving_format(paragraph, new_text: str) -> None:
             run.text = ''
         return
 
+    # Keep replacement boundaries between words. Character-proportional
+    # slicing could split a word across runs and visibly damage mixed styles.
+    tokens = re.findall(r'\S+\s*', new_text)
+    if not tokens:
+        tokens = [new_text]
+    token_ends = []
+    for token in tokens:
+        token_ends.append((token_ends[-1] if token_ends else 0) + len(token))
+
     cursor = 0
-    cumulative = 0
+    old_cumulative = 0
+    token_start = 0
     for index, (run, old_length) in enumerate(zip(runs, old_lengths)):
-        cumulative += old_length
-        end = len(new_text) if index == len(runs) - 1 else round(
-            len(new_text) * cumulative / old_total
-        )
+        old_cumulative += old_length
+        if old_length == 0 and index < len(runs) - 1:
+            run.text = ''
+            continue
+        if index == len(runs) - 1:
+            end_token = len(tokens)
+        else:
+            target = len(new_text) * old_cumulative / old_total
+            candidates = range(token_start, len(token_ends))
+            end_token = min(candidates, key=lambda i: abs(token_ends[i] - target)) + 1 if token_start < len(tokens) else len(tokens)
+        end = token_ends[end_token - 1] if end_token > 0 else cursor
         run.text = new_text[cursor:end]
         cursor = end
+        token_start = end_token
+
+    if cursor < len(new_text):
+        runs[-1].text = (runs[-1].text or '') + new_text[cursor:]
 
 
 def _replace_text_frame_text(text_frame, rewritten_paragraphs: list[str]) -> None:

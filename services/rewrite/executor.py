@@ -25,6 +25,7 @@ import difflib
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
 
 from services.ai import get_provider
@@ -333,7 +334,7 @@ class RewriteExecutor:
         to_rewrite: list[dict],
         presentation_context: Optional[dict],
     ) -> list[dict]:
-        tone = self.planner.tone
+        tone = f"{self.planner.tone}: {self.planner.tone_instruction}"
         topic = detect_topic(all_slides, presentation_context)
         outline = deck_outline(all_slides)
         logger.info("[executor] REFRESH topic=%r tone=%r slides=%d", topic, tone, len(to_rewrite))
@@ -394,27 +395,66 @@ class RewriteExecutor:
         context_summary: Optional[str] = None,
         focus_items: Optional[list[str]] = None,
     ) -> list[dict]:
-        """Execute rewrite for a single batch of slides (per-slide recovery)."""
+        """Rewrite small slide groups per provider call, with per-slide recovery."""
+        groups = [batch_slides[start:start + 5] for start in range(0, len(batch_slides), 5)]
+
+        def request_group(slide_group):
+            prompt = build_rewrite_prompt(
+                slide_group, grammar_issues_summary, presentation_context,
+                mode=self.planner.mode, tone=self.planner.tone, focus_items=focus_items,
+            )
+            error = None
+            for attempt in range(2):  # one bounded retry for a failed provider request
+                try:
+                    response = self.provider.generate_structured(
+                        prompt=prompt, temperature=0.2, max_output_tokens=8192,
+                    )
+                    by_number = {}
+                    if isinstance(response, dict):
+                        for item in response.get('slides', []):
+                            if isinstance(item, dict):
+                                try:
+                                    by_number[int(item.get('slide_number'))] = item
+                                except (TypeError, ValueError):
+                                    continue
+                    return by_number, None, attempt
+                except Exception as exc:
+                    error = str(exc)
+                    if attempt == 0:
+                        time.sleep(0.25)
+            return {}, error, 1
+
         rewritten = []
+        # Two concurrent batches reduce wall time without creating an
+        # unbounded burst against the configured provider.
+        with ThreadPoolExecutor(max_workers=min(2, max(1, len(groups)))) as pool:
+            pending = {pool.submit(request_group, group): group for group in groups}
+            for future in as_completed(pending):
+                slide_group = pending[future]
+                try:
+                    by_number, call_error, retries = future.result()
+                except Exception as exc:
+                    by_number, call_error, retries = {}, str(exc), 0
+                self.metrics['model_calls'] += 1 + retries
+                self.metrics['retry_count'] += retries
+                for slide in slide_group:
+                    slide_num = slide.get('slide_number')
+                    result = by_number.get(slide_num)
+                    try:
+                        if result:
+                            result = self._apply_guards(slide, result)
+                            result['_change_severity'] = self._classify_severity(slide, result)
+                            self.metrics['ai_slides_succeeded'] += 1
+                            rewritten.append(result)
+                        else:
+                            rewritten.append(self._fallback_slide(
+                                slide, error=call_error or 'AI response omitted slide'
+                            ))
+                    except Exception as exc:
+                        logger.error("[executor] Slide %s rewrite failed: %s", slide_num, exc)
+                        rewritten.append(self._fallback_slide(slide, error=str(exc)))
 
-        for slide in batch_slides:
-            slide_num = slide.get('slide_number')
-            try:
-                result = self._rewrite_single_slide(
-                    slide, grammar_issues_summary, presentation_context, focus_items
-                )
-                if result:
-                    result = self._apply_guards(slide, result)
-                    result['_change_severity'] = self._classify_severity(slide, result)
-                    self.metrics['ai_slides_succeeded'] += 1
-                    rewritten.append(result)
-                else:
-                    rewritten.append(self._fallback_slide(slide))
-            except Exception as exc:
-                logger.error("[executor] Slide %s rewrite failed: %s", slide_num, exc)
-                rewritten.append(self._fallback_slide(slide, error=str(exc)))
-
-        return rewritten
+        return sorted(rewritten, key=lambda result: result.get('slide_number') or 0)
 
     def _rewrite_single_slide(
         self,
@@ -505,10 +545,64 @@ class RewriteExecutor:
 
             guarded_textboxes.append({'shape_index': idx, 'paragraphs': paragraphs})
 
+        # Tables and editable chart titles are also supported rewrite targets.
+        # Validate them against the source structure so omitted/extra cells do
+        # not silently become unchanged-but-successful output.
+        def guarded_paragraphs(original, candidate):
+            original = [_para_text(value) for value in (original or [])]
+            candidate = candidate or []
+            if len(candidate) != len(original):
+                self.metrics['guard_reverted_textboxes'] += 1
+                return original
+            output = []
+            for before, after in zip(original, candidate):
+                text, reverted = guard(before, after)
+                if reverted:
+                    self.metrics['guard_reverted_paragraphs'] += 1
+                output.append(text)
+            return output
+
+        rewritten_tables = {
+            table.get('shape_index'): table
+            for table in (result.get('tables') or []) if isinstance(table, dict)
+        }
+        guarded_tables = []
+        for source_table in slide.get('tables_data') or slide.get('tables') or []:
+            candidate = rewritten_tables.get(source_table.get('shape_index'), {})
+            candidate_cells = {
+                (cell.get('row_index'), cell.get('column_index')): cell
+                for cell in (candidate.get('cells') or []) if isinstance(cell, dict)
+            }
+            cells = []
+            for source_cell in source_table.get('cells') or []:
+                key = (source_cell.get('row_index'), source_cell.get('column_index'))
+                candidate_cell = candidate_cells.get(key, {})
+                cells.append({
+                    'row_index': key[0], 'column_index': key[1],
+                    'paragraphs': guarded_paragraphs(
+                        source_cell.get('paragraphs'), candidate_cell.get('paragraphs')
+                    ) if candidate_cell else [_para_text(p) for p in source_cell.get('paragraphs', [])],
+                })
+            guarded_tables.append({'shape_index': source_table.get('shape_index'), 'cells': cells})
+
+        rewritten_charts = {
+            chart.get('shape_index'): chart
+            for chart in (result.get('charts') or []) if isinstance(chart, dict)
+        }
+        guarded_charts = []
+        for source_chart in slide.get('charts_data') or slide.get('charts') or []:
+            candidate = rewritten_charts.get(source_chart.get('shape_index'), {})
+            source_title = source_chart.get('title_paragraphs') or []
+            guarded_charts.append({
+                'shape_index': source_chart.get('shape_index'),
+                'title_paragraphs': guarded_paragraphs(source_title, candidate.get('title_paragraphs'))
+                if candidate else [_para_text(p) for p in source_title],
+            })
+
         result['textboxes'] = guarded_textboxes
+        result['tables'] = guarded_tables
+        result['charts'] = guarded_charts
         result.setdefault('slide_number', slide.get('slide_number'))
-        result.setdefault('tables', [])
-        result.setdefault('charts', [])
         return result
 
     # ------------------------------------------------------------------ #

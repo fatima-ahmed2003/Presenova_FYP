@@ -2,7 +2,6 @@ import React, { useState, useRef, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { useLiveSession } from '../hooks/useLiveSession';
 import VideoCapture from '../components/VideoCapture';
-import LiveFeedbackOverlay from '../components/LiveFeedbackOverlay';
 import ReportDashboard from '../components/ReportDashboard';
 import { downloadProgressReportPDF } from '../services/pdfGenerator';
 import './LiveCoach.css';
@@ -57,6 +56,24 @@ const CHECKLIST_ITEMS = [
   'I am in a quiet place',
 ];
 
+const BLENDSHAPE_LABELS: Record<string, string> = {
+  mouthSmileLeft: 'Mouth corner (L)', mouthSmileRight: 'Mouth corner (R)',
+  eyeBlinkLeft: 'Eye blink (L)', eyeBlinkRight: 'Eye blink (R)',
+  browDownLeft: 'Brow movement (L)', browDownRight: 'Brow movement (R)',
+  jawOpen: 'Jaw opening', mouthPressLeft: 'Mouth press (L)', mouthPressRight: 'Mouth press (R)',
+};
+
+const formatBlendshapeReport = (values?: Record<string, number> | null) => {
+  if (!values) return 'N/A';
+  const entries = Object.entries(values)
+    .filter(([, value]) => Number.isFinite(value))
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3);
+  return entries.length
+    ? entries.map(([name, value]) => `${BLENDSHAPE_LABELS[name] || name}: ${Math.round(value)}%`).join(' · ')
+    : 'N/A';
+};
+
 const LiveCoach: React.FC = () => {
   const { user } = useAuth();
   const userId = user?.id || 'guest';
@@ -80,6 +97,7 @@ const LiveCoach: React.FC = () => {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [fullscreenError, setFullscreenError] = useState<string | null>(null);
   const [liveTip, setLiveTip] = useState({ key: 'ready', title: 'Live Coach', body: 'Look toward the camera when the session begins.' });
+  const [criticalWarning, setCriticalWarning] = useState<string | null>(null);
 
   // Start screen extras (display only)
   const [checks, setChecks] = useState<boolean[]>(CHECKLIST_ITEMS.map(() => false));
@@ -92,6 +110,7 @@ const LiveCoach: React.FC = () => {
   const sessionStartedAtRef = useRef<number | null>(null);
   const finishRef = useRef<() => void>(() => undefined);
   const previousTipKeyRef = useRef('');
+  const warningCandidateRef = useRef<{ key: string; message: string; timer: number } | null>(null);
 
   const {
     status,
@@ -261,6 +280,7 @@ const LiveCoach: React.FC = () => {
       { label: 'Camera-Facing Gaze (Approx.)', v1: hasGazeMetrics && v1Report.session_metrics?.avg_eye_contact != null ? `${v1Report.session_metrics.avg_eye_contact}%` : 'N/A', v2: hasGazeMetrics && v1Report.session_metrics?.avg_eye_contact != null ? `${v1Report.session_metrics.avg_eye_contact}%` : 'N/A', change: '' },
       { label: 'Upper-Body Posture Estimate', v1: hasPostureMetrics && v1Report.session_metrics?.avg_posture != null ? `${v1Report.session_metrics.avg_posture}%` : 'N/A', v2: hasPostureMetrics && v1Report.session_metrics?.avg_posture != null ? `${v1Report.session_metrics.avg_posture}%` : 'N/A', change: '' },
       { label: 'Visual Tracking Proxy', v1: hasTrackingProxy && v1Report.session_metrics?.avg_confidence != null ? `${v1Report.session_metrics.avg_confidence}%` : 'N/A', v2: hasTrackingProxy && v1Report.session_metrics?.avg_confidence != null ? `${v1Report.session_metrics.avg_confidence}%` : 'N/A', change: '' },
+      { label: 'Facial Blendshape Coefficients', v1: formatBlendshapeReport(v1Report.session_metrics?.avg_facial_blendshapes), v2: formatBlendshapeReport(v1Report.session_metrics?.avg_facial_blendshapes), change: '' },
       { label: 'Vocal Pitch Dynamics', v1: 'N/A', v2: 'N/A', change: '' },
       { label: 'Speaking Pace', v1: hasAudioMetrics && v1Report.session_metrics?.avg_wpm != null ? `${v1Report.session_metrics.avg_wpm} WPM` : 'N/A', v2: hasAudioMetrics && v1Report.session_metrics?.avg_wpm != null ? `${v1Report.session_metrics.avg_wpm} WPM` : 'N/A', change: '' },
       { label: 'Filler Words Count', v1: hasAudioMetrics && v1Report.session_metrics?.total_fillers != null ? `${v1Report.session_metrics.total_fillers}` : 'N/A', v2: hasAudioMetrics && v1Report.session_metrics?.total_fillers != null ? `${v1Report.session_metrics.total_fillers}` : 'N/A', change: '' },
@@ -312,27 +332,59 @@ const LiveCoach: React.FC = () => {
     : !!stream && stream.getVideoTracks().some((t) => t.readyState === 'live'));
   const micOn = micActive;
 
-  const eye = realtimeFeedback.eyeContact ?? 0;
-  const pos = realtimeFeedback.posture ?? 0;
-  const conf = realtimeFeedback.confidence ?? 0;
+  const eye = realtimeFeedback.eyeContact;
+  const pos = realtimeFeedback.posture;
+  const conf = realtimeFeedback.confidence;
+  const headMovement = realtimeFeedback.headMovement;
+  const facialBlendshapes = realtimeFeedback.facialBlendshapes;
   const faceDetected = realtimeFeedback.faceDetected;
   const gazeAvailable = faceDetected && realtimeFeedback.eyeContact !== null;
   const postureAvailable = realtimeFeedback.posture !== null;
-  const headMovementAvailable = realtimeFeedback.headMovement !== null;
+  const headMovementAvailable = headMovement !== null;
   const trackingProxyAvailable = realtimeFeedback.confidence !== null;
-  const displayEmotion = ['smile', 'neutral', 'tense'].includes(realtimeFeedback.emotion.toLowerCase())
-    ? realtimeFeedback.emotion
-    : 'N/A';
-
-  const statusNote = (v: number, good: string, ok: string, low: string) =>
-    v >= 80 ? good : v >= 60 ? ok : low;
-
-  const frameClass = !gazeAvailable ? 'unavailable' : eye >= 80 ? 'good' : eye >= 60 ? 'mid' : 'low';
+  const facialBlendshapeEntries = Object.entries(facialBlendshapes || {})
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3);
+  const facialBlendshapeReadout = facialBlendshapeEntries
+    .map(([name, value]) => `${BLENDSHAPE_LABELS[name] || name}: ${Math.round(value * 100)}%`)
+    .join(' · ');
 
   const reminders = ['Maintain eye contact', 'Keep good posture', 'Avoid filler words', 'Speak at a steady pace', 'Stay centered'];
 
   const allChecked = checks.every(Boolean);
   const checkedCount = checks.filter(Boolean).length;
+
+  useEffect(() => {
+    const existingKey = warningCandidateRef.current?.key;
+    const measurements = [
+      { key: 'gaze', value: eye, confidence: realtimeFeedback.metricConfidence.eyeContact, calibrated: realtimeFeedback.gazeCalibrationStatus === 'calibrated', message: 'Camera-facing gaze estimate remains low; look toward the lens when appropriate.' },
+      { key: 'posture', value: pos, confidence: realtimeFeedback.metricConfidence.posture, calibrated: true, message: 'Measured upper-body alignment remains low; adjust your shoulder and torso position.' },
+      { key: 'head', value: headMovement, confidence: realtimeFeedback.metricConfidence.headMovement, calibrated: true, message: 'Measured head steadiness remains low; reduce repeated head turns.' },
+    ];
+    const candidate = ['STREAMING', 'INTERRUPTED_Q&A'].includes(status)
+      ? measurements.find((metric) => metric.calibrated && metric.value !== null
+        && metric.confidence !== null && metric.confidence >= 70
+        && metric.value < (metric.key === existingKey ? 45 : 35))
+      : undefined;
+
+    if (!candidate) {
+      if (warningCandidateRef.current) window.clearTimeout(warningCandidateRef.current.timer);
+      warningCandidateRef.current = null;
+      setCriticalWarning(null);
+      return;
+    }
+    if (warningCandidateRef.current?.key === candidate.key) return;
+
+    if (warningCandidateRef.current) window.clearTimeout(warningCandidateRef.current.timer);
+    setCriticalWarning(null);
+    const warning = { key: candidate.key, message: candidate.message, timer: 0 };
+    warning.timer = window.setTimeout(() => setCriticalWarning(warning.message), 1200);
+    warningCandidateRef.current = warning;
+  }, [status, eye, pos, headMovement, realtimeFeedback.metricConfidence, realtimeFeedback.gazeCalibrationStatus]);
+
+  useEffect(() => () => {
+    if (warningCandidateRef.current) window.clearTimeout(warningCandidateRef.current.timer);
+  }, []);
 
   useEffect(() => {
     if (status !== 'STREAMING' && status !== 'INTERRUPTED_Q&A') return;
@@ -449,20 +501,8 @@ const LiveCoach: React.FC = () => {
                       retryKey={cameraRetryKey}
                       onError={(msg) => { setCameraError(msg); clearVisualFeedback(msg); }}
                     />
-                    <LiveFeedbackOverlay
-                      eyeContact={realtimeFeedback.eyeContact}
-                      posture={realtimeFeedback.posture}
-                      faceDetected={faceDetected}
-                      hint={realtimeFeedback.hint}
-                      isStreaming={true}
-                      confidence={realtimeFeedback.confidence}
-                      emotion={displayEmotion}
-                      gazeCalibrationStatus={realtimeFeedback.gazeCalibrationStatus}
-                    />
                     <div className={`lc-live-badge ${!camOn ? 'off' : ''}`}><span className="lc-live-dot"></span> {camOn ? (videoFile ? 'VIDEO' : 'LIVE') : 'CAMERA OFF'}</div>
-                    {camOn && <div className={`lc-face-frame ${frameClass}`}>
-                      <i className="tl"></i><i className="tr"></i><i className="bl"></i><i className="br"></i>
-                    </div>}
+                    {criticalWarning && <div className="lc-critical-warning" role="status">{criticalWarning}</div>}
 
                   </div>
 
@@ -514,12 +554,12 @@ const LiveCoach: React.FC = () => {
                           <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
                         </div>
                         <div className="lc-metric-text">
-                          <div className="lc-metric-num">{gazeAvailable ? `${eye}%` : 'N/A'}</div>
+                          <div className="lc-metric-num">{gazeAvailable && eye !== null ? `${eye}%` : 'N/A'}</div>
                           <div className="lc-metric-name">Camera-Facing Gaze (Approx.)</div>
                         </div>
-                        {gazeAvailable && <Ring value={eye} />}
+                        {gazeAvailable && eye !== null && <Ring value={eye} />}
                       </div>
-                      <p>{gazeAvailable ? statusNote(eye, 'Approximate camera-facing gaze detected.', 'Gaze estimate is mixed; look toward the camera when appropriate.', 'Gaze estimate suggests looking away from the camera.') : realtimeFeedback.hint}</p>
+                      <p>{gazeAvailable ? 'Estimated from iris position relative to eye landmarks after lens-facing calibration.' : realtimeFeedback.gazeCalibrationStatus === 'calibrating' ? 'For three seconds, look toward the camera lens to calibrate gaze.' : realtimeFeedback.hint}</p>
                     </div>
 
                     <div className="lc-metric">
@@ -528,12 +568,12 @@ const LiveCoach: React.FC = () => {
                           <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="5" r="2"></circle><path d="M12 7v7M8 10l4-1 4 1M10 21l2-7 2 7"></path></svg>
                         </div>
                         <div className="lc-metric-text">
-                          <div className="lc-metric-num">{postureAvailable ? `${pos}%` : 'N/A'}</div>
+                          <div className="lc-metric-num">{postureAvailable && pos !== null ? `${pos}%` : 'N/A'}</div>
                           <div className="lc-metric-name">Upper-Body Posture</div>
                         </div>
-                        {postureAvailable && <Ring value={pos} />}
+                        {postureAvailable && pos !== null && <Ring value={pos} />}
                       </div>
-                      <p>{postureAvailable ? statusNote(pos, 'Upper-body alignment estimate is high.', 'Upper-body alignment estimate is mixed.', 'Upper-body alignment estimate is low.') : realtimeFeedback.hint}</p>
+                      <p>{postureAvailable ? 'Measured from shoulder tilt and head-to-shoulder alignment using visible shoulder and hip landmarks.' : realtimeFeedback.hint}</p>
                     </div>
 
                     <div className="lc-metric">
@@ -542,12 +582,12 @@ const LiveCoach: React.FC = () => {
                           <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v3M5.6 5.6l2.1 2.1M3 12h3M5.6 18.4l2.1-2.1M12 18v3M16.3 16.3l2.1 2.1M18 12h3M16.3 7.7l2.1-2.1"/><circle cx="12" cy="12" r="4"/></svg>
                         </div>
                         <div className="lc-metric-text">
-                          <div className="lc-metric-num">{headMovementAvailable ? `${realtimeFeedback.headMovement}%` : 'N/A'}</div>
+                          <div className="lc-metric-num">{headMovementAvailable && headMovement !== null ? `${headMovement}%` : 'N/A'}</div>
                           <div className="lc-metric-name">Head Steadiness</div>
                         </div>
-                        {headMovementAvailable && <Ring value={realtimeFeedback.headMovement!} />}
+                        {headMovementAvailable && headMovement !== null && <Ring value={headMovement} />}
                       </div>
-                      <p>{headMovementAvailable ? statusNote(realtimeFeedback.headMovement!, 'Head position is steady across recent frames.', 'Some head movement is visible across recent frames.', 'Frequent head shifts are visible; try keeping your head steadier.') : realtimeFeedback.hint}</p>
+                      <p>{headMovementAvailable ? 'Calculated from yaw and pitch variation in the rolling head-pose window.' : realtimeFeedback.hint}</p>
                     </div>
 
                     <div className="lc-metric">
@@ -559,9 +599,9 @@ const LiveCoach: React.FC = () => {
                           <div className="lc-metric-num">{trackingProxyAvailable ? `${conf}%` : 'N/A'}</div>
                           <div className="lc-metric-name">Visual Tracking Proxy</div>
                         </div>
-                        {trackingProxyAvailable && <Ring value={conf} />}
+                        {trackingProxyAvailable && conf !== null && <Ring value={conf} />}
                       </div>
-                      <p>{trackingProxyAvailable ? 'Composite of measured gaze and posture availability/stability; not a psychological confidence measure.' : realtimeFeedback.hint}</p>
+                      <p>{trackingProxyAvailable ? 'Weighted composite of available gaze, posture and head steadiness measurements.' : realtimeFeedback.hint}</p>
                     </div>
 
                     <div className="lc-metric">
@@ -570,11 +610,11 @@ const LiveCoach: React.FC = () => {
                           <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><path d="M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01"></path></svg>
                         </div>
                         <div className="lc-metric-text">
-                          <div className="lc-metric-num lc-emotion">{displayEmotion}</div>
-                          <div className="lc-metric-name">Expression Classification</div>
+                          <div className="lc-metric-num lc-emotion">{facialBlendshapes ? 'Measured' : 'N/A'}</div>
+                          <div className="lc-metric-name">Facial Blendshapes</div>
                         </div>
                       </div>
-                      <p>Expression analysis is unavailable.</p>
+                      <p>{facialBlendshapes ? facialBlendshapeReadout || 'Measured coefficients are below 5%.' : realtimeFeedback.hint}</p>
                     </div>
                   </div>
 
@@ -686,6 +726,13 @@ const LiveCoach: React.FC = () => {
                 onReset={handleReset}
                 resetButtonLabel="Practice New Topic"
               />
+              {v1Report.session_metrics?.data_quality?.has_facial_blendshape_metrics && (
+                <div className="lc-blendshape-report">
+                  <h3>Measured Facial Blendshape Coefficients</h3>
+                  <p>{formatBlendshapeReport(v1Report.session_metrics?.avg_facial_blendshapes)}</p>
+                  <small>Model coefficients describe facial landmark movement; no emotion is inferred.</small>
+                </div>
+              )}
             </>
           ) : (
             <div className="lc-start fadeIn">

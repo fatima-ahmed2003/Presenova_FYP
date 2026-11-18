@@ -221,11 +221,9 @@ def rewrite_slide_dict(slide: dict, mode: str = "professional", tone: str = "pro
                 continue
 
             rewritten_text = rewrite_text_paragraph(text, mode=mode, tone=tone)
-            if len(rewritten_text.split()) > 18:
-                parts = split_bullet_point(rewritten_text, max_words=15)
-                rewritten_paras.extend(parts)
-            else:
-                rewritten_paras.append(rewritten_text)
+            # A slide rewrite must preserve the paragraph count so the text
+            # can be written back into the original styled PowerPoint runs.
+            rewritten_paras.append(rewritten_text)
 
         textboxes_out.append({
             'shape_index': shape_idx,

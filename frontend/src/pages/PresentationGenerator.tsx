@@ -1,10 +1,11 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   generatePresentation,
   generateOutline,
   generateFromOutline,
   importSeedFile,
+  pollGeneratorProgress,
   getGeneratorDownloadUrl,
   PresentationGenResponse,
   PresentationOutline,
@@ -72,6 +73,7 @@ const PresentationGenerator: React.FC = () => {
   const [tone, setTone] = useState('Professional');
   const [theme, setTheme] = useState('corporate_blue_geom');
   const [audience, setAudience] = useState('General Audience');
+  const [presentationType, setPresentationType] = useState('Auto-detect');
 
   // Custom theme overrides
   const [showSlideNumbers, setShowSlideNumbers] = useState(true);
@@ -84,6 +86,8 @@ const PresentationGenerator: React.FC = () => {
   // Status state
   const [loading, setLoading] = useState(false);
   const [loadingMessage, setLoadingMessage] = useState('');
+  const [loadingProgress, setLoadingProgress] = useState(0);
+  const progressTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<PresentationGenResponse | null>(null);
 
@@ -93,6 +97,29 @@ const PresentationGenerator: React.FC = () => {
   });
   const [showUpgradeModal, setShowUpgradeModal] = useState<boolean>(false);
   const [upgradeToast, setUpgradeToast] = useState<string | null>(null);
+
+  const beginProgress = (progressId: string) => {
+    if (progressTimer.current) clearInterval(progressTimer.current);
+    setLoadingProgress(3);
+    progressTimer.current = setInterval(async () => {
+      try {
+        const progress = await pollGeneratorProgress(progressId);
+        setLoadingProgress(progress.percent);
+        if (progress.message) setLoadingMessage(progress.message);
+      } catch { /* Request may reach the backend just after this poll. */ }
+    }, 700);
+  };
+
+  const newProgressId = () => {
+    const id = typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? crypto.randomUUID() : `ppt-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    beginProgress(id);
+    return id;
+  };
+
+  useEffect(() => () => {
+    if (progressTimer.current) clearInterval(progressTimer.current);
+  }, []);
 
   const handleSelectSlideCount = (opt: SlideCountOption) => {
     if (opt.isPaid && !isProUser) {
@@ -138,6 +165,7 @@ const PresentationGenerator: React.FC = () => {
     }
 
     setLoading(true);
+    const progressId = newProgressId();
     setLoadingMessage(inputMode === 'document' ? 'Parsing document seed and synthesizing outline...' : 'Generating structured outline & assigning smart visual layouts...');
     setError(null);
 
@@ -146,7 +174,9 @@ const PresentationGenerator: React.FC = () => {
         const resp = await importSeedFile(seedFile, {
           slide_count: slideCount,
           tone,
-          target_audience: audience.trim() || 'General Audience'
+          target_audience: audience.trim() || 'General Audience',
+          presentation_type: presentationType,
+          progress_id: progressId,
         });
         setOutline(resp.outline);
         setTopic(resp.outline.topic || seedFile.name);
@@ -155,7 +185,9 @@ const PresentationGenerator: React.FC = () => {
           topic: topic.trim(),
           slide_count: slideCount,
           tone,
-          target_audience: audience.trim() || 'General Audience'
+          target_audience: audience.trim() || 'General Audience',
+          presentation_type: presentationType,
+          progress_id: progressId,
         });
         setOutline(resp.outline);
       }
@@ -164,6 +196,7 @@ const PresentationGenerator: React.FC = () => {
     } catch (err: any) {
       setError(err.message || 'Failed to generate presentation outline.');
     } finally {
+      if (progressTimer.current) clearInterval(progressTimer.current);
       setLoading(false);
     }
   };
@@ -176,15 +209,17 @@ const PresentationGenerator: React.FC = () => {
     }
 
     setLoading(true);
+    const progressId = newProgressId();
     setLoadingMessage('Compiling presentation and rendering visual diagrams...');
     setError(null);
 
     try {
       if (seedFile) {
-        const seedResp = await importSeedFile(seedFile, { slide_count: slideCount, tone, target_audience: audience });
+        const seedResp = await importSeedFile(seedFile, { slide_count: slideCount, tone, target_audience: audience, presentation_type: presentationType, progress_id: progressId });
         const finalResp = await generateFromOutline({
           outline: seedResp.outline,
           theme,
+          progress_id: progressId,
           custom_overrides: { show_slide_numbers: showSlideNumbers, confidentiality_tag: confidentialityTag }
         });
         setResult(finalResp);
@@ -195,7 +230,9 @@ const PresentationGenerator: React.FC = () => {
           slide_count: slideCount,
           tone,
           theme,
-          target_audience: audience.trim() || 'General Audience'
+          target_audience: audience.trim() || 'General Audience',
+          presentation_type: presentationType,
+          progress_id: progressId,
         });
         setResult(finalResp);
         if (finalResp.outline) setOutline(finalResp.outline);
@@ -204,6 +241,7 @@ const PresentationGenerator: React.FC = () => {
     } catch (err: any) {
       setError(err.message || 'Failed to generate presentation.');
     } finally {
+      if (progressTimer.current) clearInterval(progressTimer.current);
       setLoading(false);
     }
   };
@@ -216,6 +254,7 @@ const PresentationGenerator: React.FC = () => {
     }
 
     setLoading(true);
+    const progressId = newProgressId();
     setLoadingMessage('Generating visual charts with matplotlib and building PowerPoint slides...');
     setError(null);
 
@@ -223,6 +262,7 @@ const PresentationGenerator: React.FC = () => {
       const finalResp = await generateFromOutline({
         outline,
         theme,
+        progress_id: progressId,
         custom_overrides: {
           show_slide_numbers: showSlideNumbers,
           confidentiality_tag: confidentialityTag
@@ -233,6 +273,7 @@ const PresentationGenerator: React.FC = () => {
     } catch (err: any) {
       setError(err.message || 'Failed to construct presentation.');
     } finally {
+      if (progressTimer.current) clearInterval(progressTimer.current);
       setLoading(false);
     }
   };
@@ -242,6 +283,13 @@ const PresentationGenerator: React.FC = () => {
     if (!outline) return;
     const updated = { ...outline };
     updated.slides[idx].title = newTitle;
+    setOutline(updated);
+  };
+
+  const updateSlideBullets = (idx: number, value: string) => {
+    if (!outline) return;
+    const updated = { ...outline };
+    updated.slides[idx].bullets = value.split('\n').map((line) => line.trim()).filter(Boolean);
     setOutline(updated);
   };
 
@@ -272,22 +320,12 @@ const PresentationGenerator: React.FC = () => {
     const newIdx = updated.slides.length + 1;
     const newSlide: SlideOutline = {
       slide_number: newIdx,
-      title: `Strategic Focus Area #${newIdx - 2}`,
-      key_takeaway: 'Key operational priority and objectives',
-      type: 'chart',
-      suggested_layout: 'chart',
-      chart_data: {
-        chart_type: 'bar',
-        title: 'Projected Metric Growth',
-        labels: ['Target A', 'Target B', 'Target C', 'Target D'],
-        values: [45, 70, 88, 95]
-      },
-      bullets: [
-        'Establish reliable benchmarks for operational efficiency.',
-        'Continuous monitoring across target parameters.',
-        'Deliver measurable impact according to project timeline.'
-      ],
-      speaker_notes: 'Highlight target performance metrics and operational significance.'
+      title: `New slide ${newIdx}`,
+      key_takeaway: '',
+      type: 'visual_split',
+      suggested_layout: 'visual_split',
+      bullets: [],
+      speaker_notes: ''
     };
     updated.slides.push(newSlide);
     setOutline(updated);
@@ -486,8 +524,16 @@ const PresentationGenerator: React.FC = () => {
               </div>
             </div>
 
-            {/* Tone & Audience */}
+            {/* Presentation type, tone and audience */}
             <div className="pg-row-fields">
+              <div className="pg-field">
+                <label className="pg-label">Presentation Type</label>
+                <select className="pg-select" value={presentationType} onChange={(e) => setPresentationType(e.target.value)} disabled={loading}>
+                  {['Auto-detect', 'Business briefing', 'Academic lecture', 'Thesis defense', 'Training', 'Proposal or pitch', 'Product or project overview'].map((item) => (
+                    <option key={item} value={item}>{item}</option>
+                  ))}
+                </select>
+              </div>
               <div className="pg-field">
                 <label className="pg-label">Delivery Tone</label>
                 <select
@@ -673,14 +719,10 @@ const PresentationGenerator: React.FC = () => {
                 )}
 
                 {/* Bullets Preview */}
-                {outline.slides[activeSlideIdx].bullets && outline.slides[activeSlideIdx].bullets!.length > 0 && (
+                {outline.slides[activeSlideIdx].suggested_layout !== 'title' && (
                   <div className="pg-inspector-bullets">
-                    <label className="pg-label">Talking Points (6x6 Brevity Enforced)</label>
-                    <ul>
-                      {outline.slides[activeSlideIdx].bullets!.map((b, bi) => (
-                        <li key={bi}>{b}</li>
-                      ))}
-                    </ul>
+                    <label className="pg-label">Talking Points (one per line)</label>
+                    <textarea className="pg-textarea" rows={5} value={(outline.slides[activeSlideIdx].bullets || []).join('\n')} onChange={(e) => updateSlideBullets(activeSlideIdx, e.target.value)} />
                   </div>
                 )}
 
@@ -878,6 +920,10 @@ const PresentationGenerator: React.FC = () => {
         <div className="pg-loading-overlay">
           <div className="pg-spinner" />
           <div className="pg-loading-text">{loadingMessage || 'Processing...'}</div>
+          <div className="pg-progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={loadingProgress}>
+            <div className="pg-progress-fill" style={{ width: `${loadingProgress}%` }} />
+          </div>
+          <div className="pg-progress-label">{loadingProgress}%</div>
         </div>
       )}
 

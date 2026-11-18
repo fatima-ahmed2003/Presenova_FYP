@@ -34,11 +34,14 @@ import json
 import logging
 import os
 import time
-from typing import Optional
+from pathlib import Path
+from typing import Callable, Optional
+from dotenv import dotenv_values
 
 from services.ai import get_provider
 from services.ai.base_provider import AIProvider
 from services.ai.fallback import FallbackManager
+from services.ai.gemini_provider import GeminiProvider
 from services.ai.prompts import build_quality_analysis_prompt, build_rewrite_prompt
 from services.analysis import (
     compute_presentation_statistics,
@@ -61,7 +64,7 @@ from services.download_service import (
     generate_output_filename,
     validate_upload_size,
 )
-from services.language_tool_service import check_grammar, summarise_grammar_issues
+from services.language_tool_service import summarise_grammar_issues
 from services.ppt_processor import (
     extract_slides,
     get_presentation_metadata,
@@ -78,6 +81,41 @@ from services.text_extractor import (
 from tools.compare_pptx import compare_pptx_files
 
 logger = logging.getLogger(__name__)
+
+
+def _get_ppt_rewrite_provider():
+    """Prefer an explicitly configured project .env locally; use runtime env on Render."""
+    project_root = Path(__file__).resolve().parent.parent
+    env_path = project_root / '.env'
+    env_values = dotenv_values(env_path) if env_path.is_file() else {}
+    is_render = bool(os.getenv('RENDER_SERVICE_ID') or os.getenv('RENDER', '').lower() == 'true')
+
+    if is_render:
+        api_key = os.getenv('GEMINI_API_KEY', '').strip()
+        fallback_setting = os.getenv('GEMINI_FALLBACK_MODELS')
+    else:
+        # dotenv_values bypasses inherited/stale GEMINI_API_KEY values when the
+        # project file contains the updated credential. Runtime env remains the
+        # compatibility path when no key is configured in .env.
+        api_key = (env_values.get('GEMINI_API_KEY') or os.getenv('GEMINI_API_KEY', '')).strip()
+        fallback_setting = env_values.get('GEMINI_FALLBACK_MODELS')
+        if fallback_setting is None:
+            fallback_setting = os.getenv('GEMINI_FALLBACK_MODELS')
+
+    if not api_key:
+        return get_provider(max_retries=0)
+
+    fallback_models = [
+        model.strip()
+        for model in (fallback_setting or '').split(',')
+        if model.strip() and model.strip() != 'gemini-flash-lite-latest'
+    ]
+    return GeminiProvider(
+        api_key=api_key,
+        model='gemini-flash-lite-latest',
+        fallback_models=fallback_models,
+        max_retries=0,
+    )
 
 # Phrases the analyzer uses when it fell back to default placeholder scores.
 _UNAVAILABLE_MARKERS = (
@@ -119,30 +157,69 @@ def _extract_paragraph_text(value) -> str:
 
 
 def _count_text_changes(original_slides: list, rewritten_slides: list) -> dict:
-    """Count how many text paragraphs were REALLY changed by the rewrite."""
-    rewritten_map = {}
-    for slide in rewritten_slides or []:
-        shapes = {}
-        for tb in slide.get('textboxes', []) or []:
-            shapes[tb.get('shape_index')] = [
-                _extract_paragraph_text(p) for p in tb.get('paragraphs', []) or []
-            ]
-        rewritten_map[slide.get('slide_number')] = shapes
+    """Count and describe validated paragraph changes across editable content."""
+    rewritten_map = {slide.get('slide_number'): slide for slide in rewritten_slides or []}
+    total = changed = 0
+    slides_changed = set()
+    examples = []
+    all_changes = []
 
-    total = 0
-    changed = 0
-    for slide in original_slides or []:
-        shapes = rewritten_map.get(slide.get('slide_number'), {})
-        for tb in slide.get('textboxes', []) or []:
-            new_paras = shapes.get(tb.get('shape_index'))
-            for i, p in enumerate(tb.get('paragraphs', []) or []):
-                orig_text = _extract_paragraph_text(p).strip()
-                if not orig_text:
-                    continue
-                total += 1
-                if new_paras is not None and i < len(new_paras) and new_paras[i].strip() != orig_text:
-                    changed += 1
-    return {'total': total, 'changed': changed}
+    def compare(slide_num, location, before, after):
+        nonlocal total, changed
+        before = _extract_paragraph_text(before).strip()
+        after = _extract_paragraph_text(after).strip()
+        if not before:
+            return
+        total += 1
+        if before != after:
+            changed += 1
+            slides_changed.add(slide_num)
+            entry = {
+                'slide_number': slide_num, 'location': location,
+                'before': before, 'after': after,
+            }
+            all_changes.append(entry)
+            if len(examples) < 12:
+                examples.append({**entry, 'before': before[:180], 'after': after[:180]})
+
+    for source in original_slides or []:
+        slide_num = source.get('slide_number')
+        result = rewritten_map.get(slide_num, {})
+        boxes = {v.get('shape_index'): v for v in result.get('textboxes', []) or []}
+        for box in source.get('textboxes', []) or []:
+            out = boxes.get(box.get('shape_index'), {})
+            for i, para in enumerate(box.get('paragraphs', []) or []):
+                candidates = out.get('paragraphs') or []
+                compare(slide_num, f"textbox {box.get('shape_index')} paragraph {i + 1}", para,
+                        candidates[i] if i < len(candidates) else para)
+
+        tables = {v.get('shape_index'): v for v in result.get('tables', []) or []}
+        for table in source.get('tables_data') or source.get('tables') or []:
+            out_table = tables.get(table.get('shape_index'), {})
+            out_cells = {(v.get('row_index'), v.get('column_index')): v
+                         for v in out_table.get('cells', []) or []}
+            for cell in table.get('cells', []) or []:
+                key = (cell.get('row_index'), cell.get('column_index'))
+                candidates = (out_cells.get(key) or {}).get('paragraphs') or []
+                for i, para in enumerate(cell.get('paragraphs', []) or []):
+                    compare(slide_num, f"table {table.get('shape_index')} cell {key} paragraph {i + 1}",
+                            para, candidates[i] if i < len(candidates) else para)
+
+        charts = {v.get('shape_index'): v for v in result.get('charts', []) or []}
+        for chart in source.get('charts_data') or source.get('charts') or []:
+            candidates = (charts.get(chart.get('shape_index')) or {}).get('title_paragraphs') or []
+            for i, para in enumerate(chart.get('title_paragraphs', []) or []):
+                compare(slide_num, f"chart {chart.get('shape_index')} title paragraph {i + 1}",
+                        para, candidates[i] if i < len(candidates) else para)
+    return {
+        'total': total, 'changed': changed, 'slides_changed': len(slides_changed),
+        'changed_slide_numbers': sorted(slides_changed), 'examples': examples,
+        'changes': all_changes,
+    }
+
+
+class NoRewriteChangesError(ValueError):
+    """Raised when validation finds no actual edits to include in an output deck."""
 
 
 def run_rewrite_pipeline(
@@ -150,6 +227,7 @@ def run_rewrite_pipeline(
     original_filename: str,
     mode: str = "professional",
     tone: str = "professional",
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> dict:
     """Rewrite a PPTX using the complete AI enhancement pipeline.
 
@@ -164,6 +242,14 @@ def run_rewrite_pipeline(
         improvements, processing_steps, metadata, and full report data.
     """
     extension = get_extension(original_filename)
+    def report_progress(index: int, message: str) -> None:
+        if progress_callback:
+            try:
+                progress_callback(index, 6, message)
+            except Exception:
+                logger.debug('[rewrite_engine] Progress update skipped.', exc_info=True)
+
+    report_progress(0, 'Validating presentation')
     if not is_allowed_for_rewrite(original_filename):
         raise ValueError(
             f"Unsupported file type '{extension}' for rewriting. Only .pptx files supported."
@@ -179,21 +265,16 @@ def run_rewrite_pipeline(
     metadata = get_presentation_metadata(temp_file_path)
     slide_count = len(slides)
     steps.append(f'Extracting text from {slide_count} slides & reading metadata')
+    report_progress(1, 'Reading slide content')
 
     # ── Step 2: Extract text for analysis ──────────────────────────────
     extracted_text = get_all_text_for_analysis(temp_file_path, original_filename)
     steps.append('Text extraction complete — preparing for analysis')
 
-    # ── Step 3: Grammar pre-check ──────────────────────────────────────
-    grammar_matches = check_grammar(extracted_text)
-    grammar_summary = summarise_grammar_issues(grammar_matches)
-    steps.append(
-        f'Grammar & spelling pre-check: {len(grammar_matches)} issue(s) detected — will be addressed in rewrite'
-        if grammar_matches else 'Grammar & spelling pre-check passed — no issues found'
-    )
-
     # ── Step 4: Initialize providers and analyzers ─────────────────────
-    provider = get_provider()
+    # Prefer the updated project .env credentials and fast model for PPT work;
+    # fallbacks are the existing Gemini models configured in that same file.
+    provider = _get_ppt_rewrite_provider()
     ai_available = provider.is_available()
     if not ai_available:
         logger.warning('[rewrite_engine] AI provider is NOT available; rule-based fallback will be used.')
@@ -232,6 +313,12 @@ def run_rewrite_pipeline(
     )
     if not isinstance(quality_scores, dict):
         quality_scores = {}
+    grammar_matches = quality_scores.get('grammar_issues') or []
+    grammar_summary = summarise_grammar_issues(grammar_matches)
+    steps.append(
+        f'Grammar & spelling pre-check: {len(grammar_matches)} issue(s) detected — will be addressed in rewrite'
+        if grammar_matches else 'Grammar & spelling pre-check passed — no issues found'
+    )
     analysis_ok = _analysis_is_real(quality_scores)
     quality_scores['analysis_available'] = analysis_ok
     if analysis_ok:
@@ -239,6 +326,7 @@ def run_rewrite_pipeline(
     else:
         logger.warning('[rewrite_engine] Quality analysis returned default/placeholder scores for %r.', original_filename)
         steps.append('AI quality analysis unavailable — default placeholder scores (not a real evaluation)')
+    report_progress(2, 'Analyzing presentation context')
 
     # ── Step 7: Additional analyses (design, storytelling, etc.) ───────
     stats = compute_presentation_statistics(slides)
@@ -260,6 +348,7 @@ def run_rewrite_pipeline(
     # ── Step 9: Execute rewrite ────────────────────────────────────────
     # Only feed pre-analysis recommendations to the rewrite when they are real.
     focus_items = quality_scores.get('recommendations', []) if analysis_ok else None
+    report_progress(3, 'Rewriting slide content')
     rewritten_slides, rewrite_metrics = executor.execute_rewrite(
         slides, grammar_summary, presentation_context,
         focus_items=focus_items,
@@ -297,6 +386,11 @@ def run_rewrite_pipeline(
     rewrite_metrics['consistency_fixes'] = consistency_fixes
 
     change_stats = _count_text_changes(slides, rewritten_slides)
+    if change_stats['changed'] == 0:
+        raise NoRewriteChangesError(
+            'No validated slide text changes were produced, so no rewritten PPTX was generated. '
+            'Try a different tone or retry when an AI provider is available.'
+        )
     steps.append(
         f"Rewrote {len(rewritten_slides)} slides: "
         f"{rewrite_metrics.get('ai_slides_succeeded', 0)} by AI, "
@@ -305,6 +399,7 @@ def run_rewrite_pipeline(
     )
     if consistency_fixes:
         steps.append(f'Unified {consistency_fixes} inconsistent spelling correction(s) across slides')
+    report_progress(4, 'Checking rewritten text and slide structure')
 
     # ── Step 10: Validate rewritten content ────────────────────────────
     semantic_result = semantic_validator.validate(slides, rewritten_slides)
@@ -351,6 +446,7 @@ def run_rewrite_pipeline(
         original_slides=slides,
         output_path=output_path,
     )
+    report_progress(5, 'Saving rewritten PowerPoint')
 
     # ── Step 14: Post-save validation (soft-fail) ───────────────────────
     preservation_ok = True
@@ -440,6 +536,8 @@ def run_rewrite_pipeline(
         if pics:
             improvements.append(f'{pics} picture(s) / chart image(s) were kept unchanged - replace any chart image that still shows placeholder figures.')
 
+    report_progress(6, 'Rewrite complete')
+
     return {
         'output_filename': output_filename,
         'slides_processed': slide_count,
@@ -452,6 +550,11 @@ def run_rewrite_pipeline(
         },
         'mode': mode,
         'tone': tone,
+        'rewrite_history': {
+            'changed_slide_numbers': change_stats['changed_slide_numbers'],
+            'total_changes': change_stats['changed'],
+            'changes': change_stats['changes'],
+        },
         'analysis_available': analysis_ok,
         'execution_metrics': {**rewrite_metrics, **{
             'text_elements_total': change_stats['total'],
@@ -613,18 +716,24 @@ def _build_improvements_summary(
 
     if total == 0:
         return ['No editable text was found in this presentation.']
+    changes = change_stats.get('examples') or []
+    actual_changes = [
+        f"Slide {item['slide_number']}, {item['location']}: “{item['before']}” → “{item['after']}”"
+        for item in changes[:5]
+    ]
     # GAP_DETECTOR
     if rewrite_metrics.get('ai_failed'):
-        return [
+        return actual_changes + [
             'The AI could not rewrite this deck (quota or timeout). '
             'The file contains only minor rule-based edits. Please retry in a few minutes.'
         ]
     if rewrite_metrics.get('no_gaps_found'):
-        return ['No content gaps were found, so no slides were rewritten.']
+        return actual_changes + ['No content gaps were found, so no slides were rewritten.']
     if changed == 0:
         return ['No text changes were needed — the existing wording was kept.']
 
-    improvements.append(f'{changed} of {total} text elements were edited')
+    improvements.append(f'{changed} of {total} text elements were edited across {change_stats.get("slides_changed", 0)} slides')
+    improvements.extend(actual_changes)
 
     reverted = rewrite_metrics.get('guard_reverted_paragraphs', 0) + rewrite_metrics.get('guard_reverted_textboxes', 0)
     if reverted:

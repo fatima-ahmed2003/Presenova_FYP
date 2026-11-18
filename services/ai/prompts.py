@@ -255,6 +255,7 @@ def build_rewrite_prompt(
 === PRESENTATION CONTEXT (background only — NEVER copy its wording into the slides) ===
 • Topic: {presentation_context.get('overall_topic', 'N/A')}
 • Objective: {presentation_context.get('main_objective', 'N/A')}
+• Audience: {presentation_context.get('audience', 'N/A')}
 • Type: {presentation_context.get('presentation_type', 'N/A')}
 • Level: {presentation_context.get('technical_level', 'N/A')}
 • Tone guidance: {presentation_context.get('tone_guidance', 'N/A')}
@@ -269,7 +270,9 @@ def build_rewrite_prompt(
 === OBJECTIVE ===
 Polish the wording of each slide (spelling, grammar, clarity, concision, tone) so it is
 scannable and easy to explain verbally — while keeping 100% of the original meaning, facts
-and visual structure. You are EDITING the author's text, not writing new content.
+and visual structure. Use the deck topic, objective, audience and nearby slide content to
+make edits specific and coherent; avoid generic filler. You are EDITING the author's text,
+not writing new content.
 {context_block}
 === RULES ===
 1. Return **only valid JSON**. No markdown, no code fences, no introductory explanations.
@@ -280,24 +283,32 @@ and visual structure. You are EDITING the author's text, not writing new content
 5. PRESERVE exactly: facts, names, dates, URLs, formulas, technical meaning, and ALL numbers and
    percentages (copy every digit exactly; do not add, remove or change any number).
 6. NEVER ADD NEW CLAIMS. Do not introduce products, industries, metrics, benefits, safety/compliance
-   claims or domain words that are not already in that paragraph (e.g. do not add "fleet", "edge",
-   "safety", "enterprise" unless the original says so). If unsure, keep the original wording.
+   claims or new technical facts. Preserve the author's technical terms; natural connective wording
+   and faithful paraphrases are allowed when they improve clarity or concision.
 7. DO NOT REWRITE branding or navigation text: footers, slide counters (e.g. "02 / 05"), lines starting
    with "PRESENOVA AI", and lines like "Audience: ... Tone: ...". In these lines you may ONLY fix a
    misspelled word; otherwise return them exactly unchanged. Never change the stated audience or tone.
 8. KEEP leading markers and structure: bullets, symbols, emoji, numbering ("01.", "A") and
    "Label: description" patterns must stay as in the original.
 9. Fix misspelled words consistently everywhere (for example a misspelled topic name) — spelling only.
-10. If a paragraph is already correct and clear, return it UNCHANGED. Fewer edits are better than risky edits.
+10. If a paragraph is already correct, clear, and concise, return it UNCHANGED. When wording is
+    awkward, redundant, grammatically incorrect, or hard to scan, make a meaningful edit rather
+    than a cosmetic synonym swap.
 11. Do not make a paragraph more than about 30% longer than the original.
 12. Titles: keep the meaning, make them clear and concise.
 13. Use parallel grammatical structure for bullet points of the same textbox.
 14. Remove weak phrases ("In this section", "As you can see", "It is important to note") when they appear.
 15. Never add, remove or reorder slides, shapes, textboxes, tables, charts, or cells.
-16. NEVER change a correct word into another form of it: do not split or merge compounds (e.g. "speedup" stays "speedup"), and do not switch noun/adjective forms (e.g. "Architectural" stays "Architectural"). Change a word only when it is a genuine spelling or grammar error.
+16. Preserve technical compounds and domain-specific part-of-speech forms (e.g. keep "speedup"
+    intact and preserve terms such as "Architectural"). You may restructure a sentence and remove
+    redundancy when meaning and technical details remain unchanged.
+
+17. For tables and editable chart titles, return the same shape indices, cell coordinates, and
+    paragraph counts in the matching `tables` and `charts` arrays. Rewrite their wording under the
+    same rules; never alter chart data.
 
 === JSON SCHEMA EXAMPLE (do NOT copy literal text, write the actual rewritten paragraphs) ===
-{{"slides":[{{"slide_number":1,"textboxes":[{{"shape_index":0,"paragraphs":["<rewritten paragraph 1>","<rewritten paragraph 2>"]}}]}}]}}
+{{"slides":[{{"slide_number":1,"textboxes":[{{"shape_index":0,"paragraphs":["<rewritten paragraph 1>"]}}],"tables":[{{"shape_index":1,"cells":[{{"row_index":0,"column_index":0,"paragraphs":["<rewritten cell paragraph>"]}}]}}],"charts":[{{"shape_index":2,"title_paragraphs":["<rewritten chart title>"]}}]}}]}}
 {grammar}{focus_block}
 === SLIDE DATA ===
 {chr(10).join(slide_blocks)}
