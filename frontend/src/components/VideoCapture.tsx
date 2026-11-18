@@ -9,7 +9,6 @@ interface VideoCaptureProps {
 }
 
 const VideoCapture: React.FC<VideoCaptureProps> = ({ videoRef, isStreaming, videoFile = null, retryKey = 0, onError }) => {
-  const [cameraActive, setCameraActive] = useState(false);
   const [cameraLoading, setCameraLoading] = useState(false);
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -32,28 +31,23 @@ const VideoCapture: React.FC<VideoCaptureProps> = ({ videoRef, isStreaming, vide
           video.onerror = () => {
             if (!active) return;
             const msg = 'The selected video could not be decoded. Try an MP4 or WebM file.';
-            setCameraActive(false);
             setCameraLoading(false);
             setErrorMessage(msg);
             onError?.(msg);
           };
-          video.onended = () => setCameraActive(false);
           video.play().then(() => {
             if (!active) return;
             if (!video.videoWidth || !video.videoHeight || !Number.isFinite(video.duration) || video.duration <= 0) {
               const msg = 'The selected video contains no readable frames.';
-              setCameraActive(false);
               setCameraLoading(false);
               setErrorMessage(msg);
               onError?.(msg);
               return;
             }
-            setCameraActive(true);
             setCameraLoading(false);
           }).catch((err) => {
             if (!active) return;
             const msg = err?.message || 'The selected video could not be played.';
-            setCameraActive(false);
             setCameraLoading(false);
             setErrorMessage(msg);
             onError?.(msg);
@@ -61,7 +55,6 @@ const VideoCapture: React.FC<VideoCaptureProps> = ({ videoRef, isStreaming, vide
         }
       } else if (!navigator.mediaDevices?.getUserMedia) {
         const msg = 'Camera access is unavailable in this browser or page context.';
-        setCameraActive(false);
         setCameraLoading(false);
         setErrorMessage(msg);
         onError?.(msg);
@@ -82,20 +75,17 @@ const VideoCapture: React.FC<VideoCaptureProps> = ({ videoRef, isStreaming, vide
                 track.onended = () => {
                   if (!active) return;
                   const msg = 'The camera stream ended. Reconnect the camera or use a video file.';
-                  setCameraActive(false);
                   setErrorMessage(msg);
                   onError?.(msg);
                 };
               });
               videoRef.current.play().then(() => {
                 if (active) {
-                  setCameraActive(true);
                   setCameraLoading(false);
                 }
               }).catch((err) => {
                 if (!active) return;
                 const msg = err?.message || 'The camera preview could not be started.';
-                setCameraActive(false);
                 setCameraLoading(false);
                 setErrorMessage(msg);
                 onError?.(msg);
@@ -104,7 +94,6 @@ const VideoCapture: React.FC<VideoCaptureProps> = ({ videoRef, isStreaming, vide
           })
           .catch((err) => {
             console.error('Error accessing webcam:', err);
-            setCameraActive(false);
           setCameraLoading(false);
             const msg = err?.message || 'Camera access was denied or device is in use by another app.';
             setErrorMessage(msg);
@@ -121,7 +110,6 @@ const VideoCapture: React.FC<VideoCaptureProps> = ({ videoRef, isStreaming, vide
         videoRef.current.removeAttribute('src');
         videoRef.current.load();
       }
-      setCameraActive(false);
       setCameraLoading(false);
     }
 
