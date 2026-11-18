@@ -283,7 +283,7 @@ def create_app():
         db_ready = _is_firestore_enabled()
         return jsonify({
             "status": "running",
-            "service": "Presenova AI Presentation Platform",
+            "service": "Presenova Presentation Platform",
             "version": "1.1.0",
             "database": "Firebase Firestore" if db_ready else "in-memory fallback"
         }), 200
