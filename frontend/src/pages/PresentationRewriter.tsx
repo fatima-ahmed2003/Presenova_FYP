@@ -357,7 +357,8 @@ const PresentationRewriter: React.FC = () => {
 
   const acceptFile = (f: File) => {
     const ext = f.name.split('.').pop()?.toLowerCase();
-    if (ext !== 'pptx' && ext !== 'pdf') { setError('Supported formats are .pptx for rewriting and .pdf/.pptx for analysis.'); return; }
+    // PDF_DISABLED: if (ext !== 'pptx' && ext !== 'pdf') { setError('Supported formats are .pptx for rewriting and .pdf/.pptx for analysis.'); return; }
+    if (ext !== 'pptx') { setError('Only .pptx files are supported.'); return; }
     if (f.size > MAX_PRESENTATION_UPLOAD_BYTES) { setError('File too large. Maximum allowed size is 50 MB.'); return; }
     setFile(f); setResult(null); setAnalysisResult(null); setSlideReport(null); setShowComparison(false); setError(null); setStage('idle'); setStep(0);
   };
@@ -435,7 +436,7 @@ const PresentationRewriter: React.FC = () => {
         <div className="pr-left">
           <div className="pr-card pr-upload-card">
             <div id="pr-dropzone" className={`pr-dropzone ${isDragging ? 'dragging' : ''} ${selectedFile ? 'has-file' : ''}`} onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop} onClick={() => fileInputRef.current?.click()}>
-              <input ref={fileInputRef} type="file" accept=".pptx,.pdf" style={{ display: 'none' }} onChange={onFileChange} id="pr-file-input" />
+              <input ref={fileInputRef} type="file" accept=".pptx" style={{ display: 'none' }} onChange={onFileChange} id="pr-file-input" />
               {selectedFile ? (
                 <div className="pr-file-info">
                   <span className="pr-file-icon">📊</span>
@@ -448,9 +449,9 @@ const PresentationRewriter: React.FC = () => {
               ) : (
                 <div className="pr-dropzone-content">
                   <div className="pr-dropzone-icon">📁</div>
-                  <p className="pr-dropzone-primary">Drop your .pptx or .pdf file here</p>
-                  <p className="pr-dropzone-secondary">PPTX rewrites text; PDF is analysis-only · Max 50 MB</p>
-                  <div className="pr-format-pills"><span className="pr-pill active">PPTX</span><span className="pr-pill muted">PDF*</span></div>
+                  <p className="pr-dropzone-primary">Drop your .pptx file here</p>
+                  <p className="pr-dropzone-secondary">Text is rewritten, design stays intact · Max 50 MB</p>
+                  <div className="pr-format-pills"><span className="pr-pill active">PPTX</span>{/* PDF_DISABLED: <span className="pr-pill muted">PDF*</span> */}</div>
                 </div>
               )}
             </div>
@@ -461,8 +462,8 @@ const PresentationRewriter: React.FC = () => {
                 <label className="pr-config-label">Mode</label>
                 <div className="pr-config-options">
                   {PROCESSING_MODES.map(m => (
-                    <button key={m} className={`pr-config-btn ${processingMode === m ? 'active' : ''}`} onClick={() => setProcessingMode(m)} disabled={stage === 'processing'}>
-                      {m === 'quick' ? '⚡ Quick' : m === 'professional' ? '🎯 Pro' : '🎓 Academic'}
+                    <button key={m} className={`pr-config-btn ${processingMode === m ? 'active' : ''}`} onClick={() => setProcessingMode(m)} disabled={stage === 'processing'} title={m === 'refresh' ? 'Replaces generic filler text with accurate topic content (design unchanged)' : undefined}>
+                      {m === 'quick' ? '⚡ Quick' : m === 'professional' ? '🎯 Pro' : m === 'refresh' ? '✨ Refresh' : '🎓 Academic'}
                     </button>
                   ))}
                 </div>

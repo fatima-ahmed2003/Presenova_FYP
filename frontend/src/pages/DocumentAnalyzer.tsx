@@ -17,7 +17,7 @@ import FileUploader from '../components/FileUploader';
 import Button from '../components/Button';
 import { useNavigate } from 'react-router-dom';
 import { analyzeDocument } from '../services/api';
-import { AnalysisReport } from '../types';
+import { AnalysisReport, DocumentAiSuggestion, DocumentUnit } from '../types';
 import { downloadProgressReportPDF } from '../services/pdfGenerator';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
 import './DocumentAnalyzer.css';
@@ -32,14 +32,19 @@ const SevenCsPieChart: React.FC<{ scores?: any; overallScore?: number }> = ({ sc
     Complete: Math.max(25, overallScore - 15),
     Courteous: Math.min(100, overallScore + 5),
     Concrete: Math.max(25, overallScore - 8),
-    Consistent: Math.max(25, overallScore - 14)
+    Coherent: Math.max(25, overallScore - 14)
   };
   const activeScores = scores || defaultScores;
   
   const normalizedScores: Record<string, number> = {};
+  const hasCanonicalCoherentScore = Object.prototype.hasOwnProperty.call(activeScores, 'Coherent');
   Object.entries(activeScores).forEach(([key, val]) => {
-    const normalizedKey = key.charAt(0).toUpperCase() + key.slice(1);
-    normalizedScores[normalizedKey] = typeof val === 'number' ? val : 70;
+    if (key === 'Consistent' && hasCanonicalCoherentScore) return;
+    if (typeof val !== 'number') return;
+    const normalizedKey = key === 'Consistent'
+      ? 'Coherent'
+      : key.charAt(0).toUpperCase() + key.slice(1);
+    normalizedScores[normalizedKey] = val;
   });
 
   const data = Object.entries(normalizedScores).map(([name, value]) => ({
@@ -168,6 +173,7 @@ const formatImprovedText = (raw: string): string => {
 };
 
 const isNegativeNote = (s: string) => /below average|room for improvement|needs? (work|attention|improvement)|\bweak\b|\bpoor\b/i.test(s);
+const normalizedReviewText = (text: string) => text.replace(/\s+/g, ' ').trim().toLowerCase();
 
 const formatSize = (bytes: number) => (bytes >= 1024 * 1024 ? `${(bytes / (1024 * 1024)).toFixed(2)} MB` : `${(bytes / 1024).toFixed(2)} KB`);
 
@@ -178,7 +184,7 @@ const LOAD_STEPS = [
   'Building your report...',
 ];
 
-type ReportView = 'overview' | 'feedback' | 'sevencs' | 'accuracy' | 'improved';
+type ReportView = 'overview' | 'ai-review' | 'feedback' | 'sevencs' | 'accuracy' | 'improved';
 
 const DocumentAnalyzer: React.FC = () => {
   const navigate = useNavigate();
@@ -196,6 +202,7 @@ const DocumentAnalyzer: React.FC = () => {
   const [reportView, setReportView] = useState<ReportView>('overview');
   const [showFullImproved, setShowFullImproved] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [copiedFixId, setCopiedFixId] = useState<string | null>(null);
 
   // Load history from localStorage on mount
   useEffect(() => {
@@ -306,6 +313,16 @@ const DocumentAnalyzer: React.FC = () => {
     }
   };
 
+  const handleCopyFix = async (fix: string, id: string) => {
+    try {
+      await navigator.clipboard.writeText(fix);
+      setCopiedFixId(id);
+      setTimeout(() => setCopiedFixId(null), 1800);
+    } catch (e) {
+      console.warn('Copy fix failed:', e);
+    }
+  };
+
   const handleDownloadReport = () => {
     if (!analysis) return;
 
@@ -327,8 +344,8 @@ const DocumentAnalyzer: React.FC = () => {
     downloadProgressReportPDF({
       title: 'Document Analysis Report',
       documentName: safeDocName,
-      v1Score: analysis.overall_score || 75,
-      v2Score: analysis.overall_score || 75,
+      v1Score: analysis.overall_score,
+      v2Score: analysis.overall_score,
       gain: 0,
       categoryScores,
       synthesis: analysis.detailed_feedback || 'Analysis complete.',
@@ -351,14 +368,101 @@ const DocumentAnalyzer: React.FC = () => {
   const strongestRow = breakdownRows.length ? breakdownRows.reduce((a, b) => (b.value > a.value ? b : a)) : null;
   const weakestRow = breakdownRows.length ? breakdownRows.reduce((a, b) => (b.value < a.value ? b : a)) : null;
 
-  const sevenCsChips: { name: string; value: number }[] = analysis && analysis.seven_cs_scores
-    ? Object.entries(analysis.seven_cs_scores as Record<string, any>).map(([k, v]) => ({
-        name: k.charAt(0).toUpperCase() + k.slice(1),
-        value: typeof v === 'number' ? v : 0,
+  const hasCanonicalCoherentScore = !!analysis?.seven_cs_scores
+    && Object.prototype.hasOwnProperty.call(analysis.seven_cs_scores, 'Coherent');
+  const hasCanonicalCoherentEvaluation = !!analysis?.seven_cs_evaluation
+    && Object.prototype.hasOwnProperty.call(analysis.seven_cs_evaluation, 'Coherent');
+
+  const sevenCsChips: { name: string; value: number | null }[] = analysis && analysis.seven_cs_scores
+    ? Object.entries(analysis.seven_cs_scores as Record<string, any>)
+      .filter(([k]) => k !== 'Consistent' || !hasCanonicalCoherentScore)
+      .map(([k, v]) => ({
+        name: k === 'Consistent' ? 'Coherent' : k.charAt(0).toUpperCase() + k.slice(1),
+        value: typeof v === 'number' ? v : null,
       }))
     : [];
-  const strongChips = sevenCsChips.filter(c => c.value >= 60).sort((a, b) => b.value - a.value);
-  const weakChips = sevenCsChips.filter(c => c.value < 60).sort((a, b) => a.value - b.value);
+  const strongChips = sevenCsChips
+    .filter((c): c is { name: string; value: number } => c.value !== null && c.value >= 60)
+    .sort((a, b) => b.value - a.value);
+  const weakChips = sevenCsChips
+    .filter((c): c is { name: string; value: number } => c.value !== null && c.value < 60)
+    .sort((a, b) => a.value - b.value);
+
+  const documentUnits = analysis?.document_units || [];
+  const unitsByNo = new Map<number, DocumentUnit>(
+    documentUnits.map(unit => [unit.unit_no, unit])
+  );
+  const evidenceIssues = Object.values(analysis?.seven_cs_evidence || {})
+    .flatMap(dimension => dimension.issues || []);
+  const ruleReviewItems = (analysis?.quality_checks?.issues || [])
+    .filter(issue => issue.unit_no > 0)
+    .map((issue, index) => {
+      const unit = unitsByNo.get(issue.unit_no);
+      const matchingEvidence = evidenceIssues.find(item =>
+        item.unit_no === issue.unit_no
+        && item.rule === issue.rule
+        && item.original === issue.original
+      );
+      const sourceFragment = normalizedReviewText(issue.original);
+      const originalLine = [
+        ...(unit?.title ? [unit.title] : []),
+        ...(unit?.text ? unit.text.split(/\r?\n/) : []),
+      ].find(line => sourceFragment && normalizedReviewText(line).includes(sourceFragment))
+        || issue.original
+        || unit?.title
+        || unit?.text.split(/\r?\n/)[0]
+        || issue.issue;
+      const penalty = matchingEvidence?.severity_penalty || 0;
+      return {
+        id: `rule-${issue.unit_no}-${issue.rule}-${index}`,
+        unit_no: issue.unit_no,
+        original_line: originalLine,
+        problem: issue.issue,
+        fix: issue.suggestions[0] || 'Review and revise this line.',
+        severity: penalty >= 6 ? 'high' : penalty >= 4 ? 'medium' : 'low',
+        source: 'Rule-based finding' as const,
+      };
+    });
+  const aiReviewItems = (analysis?.ai_suggestions || []).map(
+    (suggestion: DocumentAiSuggestion, index) => ({
+      ...suggestion,
+      id: `ai-${suggestion.unit_no}-${index}`,
+      source: 'AI suggestion' as const,
+    })
+  );
+  const reviewItems = [
+    ...aiReviewItems,
+    ...ruleReviewItems.filter(ruleItem => !aiReviewItems.some(aiItem =>
+      aiItem.unit_no === ruleItem.unit_no
+      && normalizedReviewText(aiItem.original_line).includes(
+        normalizedReviewText(ruleItem.original_line)
+      )
+    )),
+  ];
+  const issueCountsByUnit = new Map<number, number>();
+  (analysis?.quality_checks?.issues || []).forEach(issue => {
+    if (issue.unit_no > 0) {
+      issueCountsByUnit.set(
+        issue.unit_no,
+        (issueCountsByUnit.get(issue.unit_no) || 0) + 1
+      );
+    }
+  });
+  const worstUnits = Array.from(issueCountsByUnit.entries())
+    .map(([unitNo, issueCount]) => ({
+      unit: unitsByNo.get(unitNo),
+      unitNo,
+      issueCount,
+    }))
+    .sort((a, b) => b.issueCount - a.issueCount || a.unitNo - b.unitNo)
+    .slice(0, 3);
+  const reviewGroups = Array.from(
+    new Set(reviewItems.map(item => item.unit_no))
+  ).map(unitNo => ({
+    unitNo,
+    unit: unitsByNo.get(unitNo),
+    items: reviewItems.filter(item => item.unit_no === unitNo),
+  }));
 
   const strengthNotes = analysis?.strengths || [];
   const positiveNotes = strengthNotes.filter(s => !isNegativeNote(s));
@@ -376,6 +480,7 @@ const DocumentAnalyzer: React.FC = () => {
 
   const reportViews: { id: ReportView; label: string }[] = analysis ? [
     { id: 'overview', label: 'Overview' },
+    { id: 'ai-review', label: 'AI Review' },
     { id: 'feedback', label: 'Coach Feedback' },
     { id: 'sevencs', label: '7Cs' },
     ...(analysis.context_analysis ? [{ id: 'accuracy' as ReportView, label: 'Accuracy' }] : []),
@@ -445,7 +550,7 @@ const DocumentAnalyzer: React.FC = () => {
           </div>
 
           <div className="upload-box-wrapper">
-            <FileUploader onFileSelect={handleFileSelect} loading={loading} accept=".pdf,.pptx,.doc,.docx,.txt" />
+            <FileUploader onFileSelect={handleFileSelect} loading={loading} accept=".pdf,.pptx,.docx,.txt" />
 
             {/* UI_V1_DISABLED: old selected-file block
             {file && (
@@ -495,7 +600,7 @@ const DocumentAnalyzer: React.FC = () => {
           <div className="tips-section">
             <h4>📌 What We Analyze</h4>
             <ul>
-              <li><strong>7Cs of Communication:</strong> Clear, Concise, Correct, Complete, Courteous, Concrete, Consistent</li>
+              <li><strong>7Cs of Communication:</strong> Clear, Concise, Correct, Complete, Courteous, Concrete, Coherent</li>
               <li><strong>Grammar & Style:</strong> Spelling, punctuation, sentence structure, professional tone</li>
               <li><strong>Clarity & Structure:</strong> Logical flow, paragraph organization, readability</li>
               <li><strong>Content Quality:</strong> Relevance, depth, evidence, actionability</li>
@@ -505,7 +610,7 @@ const DocumentAnalyzer: React.FC = () => {
           */}
           <h4 className="da2-section-title">What We Analyze</h4>
           <div className="da2-tips">
-            <div className="da2-tip"><strong>7Cs of Communication</strong><span>Clear, Concise, Correct, Complete, Courteous, Concrete, Consistent</span></div>
+            <div className="da2-tip"><strong>7Cs of Communication</strong><span>Clear, Concise, Correct, Complete, Courteous, Concrete, Coherent</span></div>
             <div className="da2-tip"><strong>Grammar &amp; Style</strong><span>Spelling, punctuation, sentence structure, professional tone</span></div>
             <div className="da2-tip"><strong>Clarity &amp; Structure</strong><span>Logical flow, paragraph organization, readability</span></div>
             <div className="da2-tip"><strong>Content Quality</strong><span>Relevance, depth, evidence, actionability</span></div>
@@ -639,6 +744,109 @@ const DocumentAnalyzer: React.FC = () => {
             </div>
           )}
 
+          {/* VIEW: AI suggestions and rule-based findings */}
+          {reportView === 'ai-review' && (
+            <div className="da2-ai-review">
+              <section className="da2-ai-review-top">
+                <div className="da2-panel">
+                  <h3>7Cs Summary</h3>
+                  <div className="da2-ai-score-grid">
+                    {sevenCsChips.map(item => (
+                      <div className="da2-ai-score" key={item.name}>
+                        <span>{item.name}</span>
+                        <strong>{item.value === null ? 'Not scored' : `${item.value}/100`}</strong>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div className="da2-panel">
+                  <h3>Worst 3 Units</h3>
+                  {worstUnits.length ? (
+                    <ol className="da2-worst-units">
+                      {worstUnits.map(({ unit, unitNo, issueCount }) => (
+                        <li key={unitNo}>
+                          <span>
+                            {unit?.type === 'slide' ? 'Slide' : unit?.type === 'page' ? 'Page' : 'Section'} {unitNo}
+                            {unit?.title ? ` · ${unit.title}` : ''}
+                          </span>
+                          <strong>{issueCount} issue{issueCount === 1 ? '' : 's'}</strong>
+                        </li>
+                      ))}
+                    </ol>
+                  ) : (
+                    <p className="da2-muted">No units with rule-based issues were found.</p>
+                  )}
+                </div>
+              </section>
+
+              {analysis.ai_suggestions_unavailable && (
+                <div className="da2-ai-unavailable" role="status">
+                  AI suggestions unavailable. Showing rule-based findings only; Coherence was not scored.
+                </div>
+              )}
+              {analysis.ai_suggestions_provider && (
+                <p className="da2-muted da2-ai-provider">
+                  Suggestions by {analysis.ai_suggestions_provider === 'groq' ? 'Groq' : 'Gemini'}
+                  {analysis.ai_suggestions_cached ? ' · cached by file hash' : ''}
+                </p>
+              )}
+
+              {reviewGroups.length ? (
+                reviewGroups.map(({ unit, unitNo, items }) => (
+                  <section className="da2-panel da2-review-unit" key={unitNo}>
+                    <h3>
+                      {unit?.type === 'slide' ? 'Slide' : unit?.type === 'page' ? 'Page' : 'Section'} {unitNo}
+                      {unit?.title ? ` · ${unit.title}` : ''}
+                    </h3>
+                    <div className="da2-review-cards">
+                      {items.map(item => (
+                        <article className="da2-review-card" key={item.id}>
+                          <div className="da2-review-card-head">
+                            <span className={`da2-severity ${item.severity}`}>{item.severity}</span>
+                            <span className="da2-review-source">{item.source}</span>
+                          </div>
+                          <div className="da2-review-field">
+                            <strong>Issue</strong>
+                            <p>{item.problem}</p>
+                          </div>
+                          <div className="da2-review-field">
+                            <strong>Original</strong>
+                            <blockquote>{item.original_line}</blockquote>
+                          </div>
+                          <div className="da2-review-field">
+                            <strong>Suggested fix</strong>
+                            <p>{item.fix}</p>
+                          </div>
+                          <div className="da2-review-actions">
+                            <button
+                              type="button"
+                              className="da2-mini-btn"
+                              onClick={() => handleCopyFix(item.fix, item.id)}
+                            >
+                              {copiedFixId === item.id ? 'Copied' : 'Copy fix'}
+                            </button>
+                            <button
+                              type="button"
+                              className="da2-mini-btn"
+                              disabled
+                              title="Rewrite in Presenova is coming soon."
+                            >
+                              Rewrite in Presenova
+                            </button>
+                          </div>
+                        </article>
+                      ))}
+                    </div>
+                  </section>
+                ))
+              ) : (
+                <div className="da2-panel">
+                  <p className="da2-muted">No review findings are available for this document.</p>
+                </div>
+              )}
+            </div>
+          )}
+
           {/* VIEW: Coach Feedback */}
           {reportView === 'feedback' && (
             <div className="da2-panel da2-feedback">
@@ -666,15 +874,22 @@ const DocumentAnalyzer: React.FC = () => {
           {reportView === 'sevencs' && (
             <div className="report-card seven-cs-card-container">
               <h3>7Cs of Communication Evaluation</h3>
+              {hasCanonicalCoherentScore && analysis.seven_cs_scores?.Coherent == null && (
+                <p className="da2-muted">
+                  Coherence is not scored yet and is excluded from the overall score.
+                </p>
+              )}
               <div className="seven-cs-content-split">
                 <div className="checklist-grid">
-                  {Object.entries(analysis.seven_cs_evaluation).map(([c, val]) => {
+                  {Object.entries(analysis.seven_cs_evaluation)
+                    .filter(([c]) => c !== 'Consistent' || !hasCanonicalCoherentEvaluation)
+                    .map(([c, val]) => {
                     const isObj = typeof val === 'object' && val !== null;
                     const status = isObj ? (val as any).status : null;
                     const feedback = isObj ? (val as any).feedback : String(val);
                     return (
                       <div key={c} className="c-item">
-                        <strong>{c}:</strong>{' '}
+                        <strong>{c === 'Consistent' ? 'Coherent' : c}:</strong>{' '}
                         {status && (
                           <span className={`status-badge ${status.toLowerCase().replace(/ /g, '-')}`}>
                             {status}
@@ -695,13 +910,15 @@ const DocumentAnalyzer: React.FC = () => {
             <div className="report-card" style={{ marginBottom: '1.5rem', borderLeft: '4px solid #10b981' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
                 <h3 style={{ margin: 0 }}>🔍 Context Accuracy & Factual Correctness</h3>
-                <span className="score-badge" style={{ backgroundColor: analysis.context_analysis.is_context_accurate ? '#10b981' : '#f59e0b' }}>
-                  Accuracy: {analysis.context_analysis.context_accuracy_score ?? 85}/100
+                <span className="score-badge" style={{ backgroundColor: analysis.context_analysis.is_context_accurate === true ? '#10b981' : '#f59e0b' }}>
+                  {analysis.context_analysis.context_accuracy_score == null
+                    ? 'Accuracy: Not assessed'
+                    : `Accuracy: ${analysis.context_analysis.context_accuracy_score}/100`}
                 </span>
               </div>
               
               <p style={{ fontSize: '0.9rem', color: '#e2e8f0', marginBottom: '1rem', lineHeight: 1.5 }}>
-                {analysis.context_analysis.factual_correctness_summary || "Context evaluation complete. The text aligns with the domain topic."}
+                {analysis.context_analysis.factual_correctness_summary || "Context evaluation is unavailable."}
               </p>
 
               {analysis.context_analysis.inaccuracies_detected && analysis.context_analysis.inaccuracies_detected.length > 0 && (

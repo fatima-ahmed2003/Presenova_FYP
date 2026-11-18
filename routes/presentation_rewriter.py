@@ -67,7 +67,7 @@ def _save_validated_upload(file_storage, original_filename: str) -> str:
         raise
 
 
-VALID_MODES = {'quick', 'professional', 'academic'}
+VALID_MODES = {'quick', 'professional', 'academic', 'refresh'}
 VALID_TONES = {'professional', 'academic', 'business', 'technical', 'executive', 'marketing', 'formal', 'simple_english'}
 
 

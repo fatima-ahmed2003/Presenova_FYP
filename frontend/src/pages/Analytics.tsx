@@ -871,6 +871,13 @@ const Analytics: React.FC = () => {
         const activeJson = getSafeReportJson(activeReport);
         const modalScore = getScore(activeReport);
         const modalMeta = getTypeMeta(activeReport.report_type);
+        const isLiveReport = activeReport.report_type === 'live_coaching';
+        const liveMetrics = activeJson.session_metrics;
+        const liveDataQuality = liveMetrics?.data_quality;
+        const hasLiveAudioMetrics = liveDataQuality?.has_audio_metrics !== false;
+        const hasLiveGazeMetrics = liveDataQuality?.has_gaze_metrics ?? (liveDataQuality?.has_video_metrics !== false);
+        const hasLivePostureMetrics = liveDataQuality?.has_posture_metrics ?? (liveDataQuality?.has_video_metrics !== false);
+        const hasLiveTrackingProxy = liveDataQuality?.has_tracking_proxy ?? (liveDataQuality?.has_video_metrics !== false);
         const recommendations = Array.isArray(activeJson.recommendations) ? activeJson.recommendations : [];
 
         return (
@@ -908,13 +915,14 @@ const Analytics: React.FC = () => {
                   <div className="modal-bar-list">
                     {Object.entries(activeJson.category_scores).map(([cat, val]) => {
                       const numVal = typeof val === 'number' ? val : 0;
+                      const isUnscoredLiveCategory = isLiveReport && (typeof val !== 'number' || activeJson.insufficient_data);
                       return (
                         <div key={cat} className="bar-row">
                           <span className="bar-label">{cat.replace(/_/g, ' ')}</span>
                           <div className="bar-bg">
                             <div className="bar-fill" style={{ width: `${numVal}%`, background: numVal >= 80 ? '#10b981' : numVal >= 60 ? '#fbbf24' : '#ef4444' }}></div>
                           </div>
-                          <span className="bar-value">{numVal}/100</span>
+                          <span className="bar-value">{isUnscoredLiveCategory ? 'N/A' : `${numVal}/100`}</span>
                         </div>
                       );
                     })}
@@ -923,7 +931,7 @@ const Analytics: React.FC = () => {
               )}
 
               {/* Telemetry data for audio/speech recordings */}
-              {(activeJson.speech_speed_wpm || activeJson.session_metrics) && (
+              {!isLiveReport && (activeJson.speech_speed_wpm || activeJson.session_metrics) && (
                 <div className="speech-telemetry-box">
                   <h3>Speech Delivery Metrics</h3>
                   <div className="telemetry-grid">
@@ -947,22 +955,62 @@ const Analytics: React.FC = () => {
                         {activeJson.clarity_score || activeJson.overall_score || 70}/100
                       </span>
                     </div>
-                    {activeJson.session_metrics?.avg_eye_contact !== undefined && (
+                  </div>
+                </div>
+              )}
+              {isLiveReport && liveMetrics && (
+                <div className="speech-telemetry-box">
+                  <h3>Live Session Measurements</h3>
+                  <div className="telemetry-grid">
+                    <div className="telemetry-card">
+                      <span className="tel-title">Camera-Facing Gaze (Approx.)</span>
+                      <span className="tel-val">
+                        {hasLiveGazeMetrics && liveMetrics.avg_eye_contact != null
+                          ? `${liveMetrics.avg_eye_contact}%`
+                          : 'N/A'}
+                      </span>
+                    </div>
+                    <div className="telemetry-card">
+                      <span className="tel-title">Upper-Body Posture Estimate</span>
+                      <span className="tel-val">
+                        {hasLivePostureMetrics && liveMetrics.avg_posture != null
+                          ? `${liveMetrics.avg_posture}%`
+                          : 'N/A'}
+                      </span>
+                    </div>
+                    <div className="telemetry-card">
+                      <span className="tel-title">Visual Tracking Proxy</span>
+                      <span className="tel-val">
+                        {hasLiveTrackingProxy && liveMetrics.avg_confidence != null
+                          ? `${liveMetrics.avg_confidence}%`
+                          : 'N/A'}
+                      </span>
+                    </div>
+                    <div className="telemetry-card">
+                      <span className="tel-title">Speaking Pace</span>
+                      <span className="tel-val">
+                        {hasLiveAudioMetrics && liveMetrics.avg_wpm != null ? `${liveMetrics.avg_wpm} WPM` : 'N/A'}
+                      </span>
+                    </div>
+                    <div className="telemetry-card">
+                      <span className="tel-title">Filler Words</span>
+                      <span className="tel-val">
+                        {hasLiveAudioMetrics && liveMetrics.total_fillers != null ? liveMetrics.total_fillers : 'N/A'}
+                      </span>
+                    </div>
+                    <div className="telemetry-card">
+                      <span className="tel-title">Vocal Pitch</span>
+                      <span className="tel-val">N/A</span>
+                    </div>
+                    {liveDataQuality?.video_frames_received ? (
                       <div className="telemetry-card">
-                        <span className="tel-title">Eye Contact Accuracy</span>
+                        <span className="tel-title">Face-Frame Coverage</span>
                         <span className="tel-val">
-                          {activeJson.session_metrics?.avg_eye_contact}%
+                          {liveDataQuality.video_frames_with_face ?? 0}/{liveDataQuality.video_frames_received}
+                          {' '}({liveDataQuality.valid_frame_coverage ?? 0}%)
                         </span>
                       </div>
-                    )}
-                    {activeJson.session_metrics?.avg_posture !== undefined && (
-                      <div className="telemetry-card">
-                        <span className="tel-title">Body Posture Accuracy</span>
-                        <span className="tel-val">
-                          {activeJson.session_metrics?.avg_posture}%
-                        </span>
-                      </div>
-                    )}
+                    ) : null}
                   </div>
                 </div>
               )}

@@ -1,23 +1,30 @@
 import React from 'react';
 
 interface LiveFeedbackOverlayProps {
-  eyeContact: number;
-  posture: number;
+  eyeContact: number | null;
+  posture: number | null;
+  faceDetected: boolean;
   hint: string;
   isStreaming: boolean;
-  confidence: number;
+  confidence: number | null;
   emotion: string;
+  gazeCalibrationStatus: 'calibrating' | 'calibrated' | 'unavailable';
 }
 
 const LiveFeedbackOverlay: React.FC<LiveFeedbackOverlayProps> = ({
   eyeContact,
   posture,
+  faceDetected,
   hint,
   isStreaming,
   confidence,
   emotion,
+  gazeCalibrationStatus,
 }) => {
   if (!isStreaming) return null;
+  const normalizedEmotion = ['smile', 'neutral', 'tense'].includes(emotion.toLowerCase())
+    ? emotion
+    : 'N/A';
 
   // Compute status colors
   const getScoreColor = (score: number) => {
@@ -26,64 +33,53 @@ const LiveFeedbackOverlay: React.FC<LiveFeedbackOverlayProps> = ({
     return '#ef4444'; // Red
   };
 
-  const getEmotionColor = (emo: string) => {
-    switch (emo.toLowerCase()) {
-      case 'confident':
-      case 'engaging':
-        return '#10b981'; // Green
-      case 'neutral':
-        return '#6366f1'; // Indigo
-      case 'distracted':
-      case 'anxious':
-        return '#f59e0b'; // Amber
-      case 'nervous':
-        return '#ef4444'; // Red
-      default:
-        return '#6b7280'; // Gray
-    }
-  };
-
   return (
-    <div style={wrapperStyle}>
+    <div className="lc-feedback-overlay" style={wrapperStyle}>
       {/* Real-time Indicator Banners */}
-      <div style={hudContainerStyle}>
-        <div style={hudItemStyle}>
-          <span style={hudLabelStyle}>EYE CONTACT</span>
-          <span style={{ ...hudValueStyle, color: getScoreColor(eyeContact) }}>
-            {eyeContact}%
+      <div className="lc-feedback-hud" style={hudContainerStyle}>
+        <div className="lc-feedback-hud-item" style={hudItemStyle}>
+          <span style={hudLabelStyle}>CAMERA-FACING GAZE (APPROX.)</span>
+          <span style={{ ...hudValueStyle, color: faceDetected && eyeContact !== null ? getScoreColor(eyeContact) : '#94a3b8' }}>
+            {faceDetected && eyeContact !== null ? `${eyeContact}%` : 'N/A'}
           </span>
         </div>
-        <div style={hudItemStyle}>
-          <span style={hudLabelStyle}>POSTURE</span>
-          <span style={{ ...hudValueStyle, color: getScoreColor(posture) }}>
-            {posture}%
+        <div className="lc-feedback-hud-item" style={hudItemStyle}>
+          <span style={hudLabelStyle}>UPPER-BODY POSTURE</span>
+          <span style={{ ...hudValueStyle, color: posture !== null ? getScoreColor(posture) : '#94a3b8' }}>
+            {posture !== null ? `${posture}%` : 'N/A'}
           </span>
         </div>
-        <div style={hudItemStyle}>
-          <span style={hudLabelStyle}>CONFIDENCE</span>
-          <span style={{ ...hudValueStyle, color: getScoreColor(confidence) }}>
-            {confidence}%
+        <div className="lc-feedback-hud-item" style={hudItemStyle}>
+          <span style={hudLabelStyle}>VISUAL TRACKING PROXY</span>
+          <span style={{ ...hudValueStyle, color: confidence !== null ? getScoreColor(confidence) : '#94a3b8' }}>
+            {confidence !== null ? `${confidence}%` : 'N/A'}
           </span>
         </div>
+        {gazeCalibrationStatus === 'calibrating' && (
+          <div className="lc-feedback-hud-item" style={{ ...hudItemStyle, borderColor: 'rgba(139,92,246,0.8)' }}>
+            <span style={hudLabelStyle}>GAZE CALIBRATION</span>
+            <span style={{ ...hudValueStyle, color: '#c4b5fd', fontSize: '0.8rem' }}>Look at camera</span>
+          </div>
+        )}
       </div>
 
       {/* Dynamic Hint Prompt Bubble with Facial Emotion */}
-      {(hint || emotion) && (
-        <div style={hintBubbleStyle}>
+      {(hint || normalizedEmotion !== 'N/A') && (
+        <div className="lc-feedback-hint" style={hintBubbleStyle}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', width: '100%' }}>
-            {emotion && (
+            {normalizedEmotion !== 'N/A' && (
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                <span style={{ fontSize: '0.7rem', fontWeight: 800, color: '#94a3b8', letterSpacing: '0.05em' }}>FACIAL EMOTION:</span>
+                <span style={{ fontSize: '0.7rem', fontWeight: 800, color: '#94a3b8', letterSpacing: '0.05em' }}>EXPRESSION CLASSIFICATION:</span>
                 <span style={{
                   fontSize: '0.75rem',
                   fontWeight: 800,
                   color: '#ffffff',
-                  backgroundColor: getEmotionColor(emotion),
+                  backgroundColor: '#6b7280',
                   padding: '0.15rem 0.5rem',
                   borderRadius: '4px',
                   textTransform: 'uppercase'
                 }}>
-                  {emotion}
+                  {normalizedEmotion}
                 </span>
               </div>
             )}

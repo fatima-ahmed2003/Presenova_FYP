@@ -47,8 +47,7 @@ def test_offline_evaluator():
     print("\n--- Test 2: Speech Analyzer (Offline) ---")
     speech_text = "Um, hello panel. I am, like, basically going to explain our thesis project. Actually, it is quite useful."
     speech_res = evaluate_7cs(speech_text, module_type='speech', context_metrics={"speech_speed_wpm": 135, "filler_count": 4, "filler_percentage": 5.2})
-    print(f"✅ Speech Overall Score: {speech_res['overall_score']}")
-    print(f"✅ Detailed Feedback: {speech_res['detailed_feedback']}")
+    print("Speech score unavailable while Gemini is disabled; no fallback score was generated.")
 
     # Test Live Mode
     print("\n--- Test 3: Live Coach Evaluation (Offline) ---")

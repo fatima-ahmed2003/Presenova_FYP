@@ -130,6 +130,24 @@ function checkAndAddPageBreak(
 // MAIN PDF EXPORT FUNCTION
 // ============================================================================
 
+const formatSevenCsEvaluation = (evaluation: unknown): string => {
+  if (typeof evaluation === 'string') {
+    return evaluation;
+  }
+  if (evaluation === null || typeof evaluation !== 'object') {
+    return '';
+  }
+
+  const parts: string[] = [];
+  if ('status' in evaluation && typeof evaluation.status === 'string' && evaluation.status) {
+    parts.push(evaluation.status);
+  }
+  if ('feedback' in evaluation && typeof evaluation.feedback === 'string' && evaluation.feedback) {
+    parts.push(evaluation.feedback);
+  }
+  return parts.join(': ');
+};
+
 /**
  * Generates and downloads a professional PDF report from analysis data
  * 
@@ -277,9 +295,16 @@ export function downloadReportPdf(
   doc.setFontSize(FONT_SIZES.bodyText);
   doc.setFont('Helvetica', 'normal');
 
-  const sevenCsEntries = Object.entries(reportData.seven_cs_evaluation);
+  const evaluations = reportData.seven_cs_evaluation;
+  const hasCanonicalCoherentEvaluation = Object.prototype.hasOwnProperty.call(evaluations, 'Coherent');
+  const sevenCsEntries = Object.entries(evaluations)
+    .filter(([criterion]) => criterion !== 'Consistent' || !hasCanonicalCoherentEvaluation)
+    .map(([criterion, evaluation]) => ({
+      criterion: criterion === 'Consistent' ? 'Coherent' : criterion,
+      evaluation,
+    }));
 
-  for (const [criterion, evaluation] of sevenCsEntries) {
+  for (const { criterion, evaluation } of sevenCsEntries) {
     yPosition = checkAndAddPageBreak(doc, yPosition, 8);
 
     // Bold criterion name
@@ -290,7 +315,7 @@ export function downloadReportPdf(
     // Regular evaluation text with wrapping
     doc.setFont('Helvetica', 'normal');
     const evaluationLines = doc.splitTextToSize(
-      evaluation,
+      formatSevenCsEvaluation(evaluation),
       CONTENT_WIDTH_MM - 5
     );
 

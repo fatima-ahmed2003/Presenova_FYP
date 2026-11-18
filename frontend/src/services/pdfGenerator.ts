@@ -3,10 +3,10 @@ import { jsPDF } from 'jspdf';
 export interface ProgressReportPDFData {
   title: string;
   documentName: string;
-  v1Score: number;
-  v2Score: number;
-  gain: number;
-  categoryScores: Array<{ name: string; v1: number; v2: number }>;
+  v1Score: number | string;
+  v2Score: number | string;
+  gain: number | string;
+  categoryScores: Array<{ name: string; v1: number | string; v2: number | string }>;
   synthesis: string;
   improvements: string[];
   remaining: string[];
@@ -116,10 +116,10 @@ export const downloadProgressReportPDF = (data: ProgressReportPDFData, fileName:
   
   doc.setFontSize(14);
   doc.setTextColor(79, 70, 229); // Violet
-  doc.text(`${data.v1Score} / 100`, marginX + 10, currentY + 18);
+  doc.text(typeof data.v1Score === 'number' ? `${data.v1Score} / 100` : data.v1Score, marginX + 10, currentY + 18);
   doc.setTextColor(16, 185, 129); // Emerald V2
-  doc.text(`${data.v2Score} / 100`, marginX + 65, currentY + 18);
-  doc.text(`+${data.gain} Points`, marginX + 120, currentY + 18);
+  doc.text(typeof data.v2Score === 'number' ? `${data.v2Score} / 100` : data.v2Score, marginX + 65, currentY + 18);
+  doc.text(typeof data.gain === 'number' ? `+${data.gain} Points` : data.gain, marginX + 120, currentY + 18);
   
   currentY += 32;
 
@@ -147,21 +147,26 @@ export const downloadProgressReportPDF = (data: ProgressReportPDFData, fileName:
     doc.setFontSize(9.5);
     doc.setTextColor(51, 65, 85);
     doc.text(cat.name, marginX + 5, currentY);
-    doc.text(`${cat.v1}%`, marginX + 90, currentY);
-    doc.text(`${cat.v2}%`, marginX + 120, currentY);
+    doc.text(typeof cat.v1 === 'number' ? `${cat.v1}%` : cat.v1, marginX + 90, currentY);
+    doc.text(typeof cat.v2 === 'number' ? `${cat.v2}%` : cat.v2, marginX + 120, currentY);
     
-    const diff = cat.v2 - cat.v1;
-    if (diff > 0) {
+    const diff = typeof cat.v1 === 'number' && typeof cat.v2 === 'number'
+      ? cat.v2 - cat.v1
+      : null;
+    if (diff !== null && diff > 0) {
       doc.setTextColor(16, 185, 129);
       doc.setFont("helvetica", "bold");
       doc.text(`+${diff}%`, marginX + 150, currentY);
-    } else if (diff < 0) {
+    } else if (diff !== null && diff < 0) {
       doc.setTextColor(239, 68, 68);
       doc.setFont("helvetica", "bold");
       doc.text(`${diff}%`, marginX + 150, currentY);
-    } else {
+    } else if (diff !== null) {
       doc.setTextColor(100, 116, 139);
       doc.text("0%", marginX + 150, currentY);
+    } else {
+      doc.setTextColor(100, 116, 139);
+      doc.text("N/A", marginX + 150, currentY);
     }
     
     currentY += 7;

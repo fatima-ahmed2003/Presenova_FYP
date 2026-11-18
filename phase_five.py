@@ -131,7 +131,7 @@ def _gemini_coach_response(prompt: str) -> str:
     """Returns '' if Gemini is unavailable or gives an empty answer."""
     try:
         from services.ai.gemini_provider import GeminiProvider
-        provider = GeminiProvider()
+        provider = GeminiProvider(timeout_seconds=8.0, max_retries=0, fallback_models=[])
         if not provider.is_available():
             logger.warning("[AI COACH] Gemini provider not available.")
             return ''
@@ -168,7 +168,7 @@ def _groq_coach_response(prompt: str) -> str:
             return ''
 
         from groq import Groq
-        client = Groq(api_key=key, timeout=20.0)
+        client = Groq(api_key=key, timeout=12.0)
         r = client.chat.completions.create(
             model=model,
             messages=[

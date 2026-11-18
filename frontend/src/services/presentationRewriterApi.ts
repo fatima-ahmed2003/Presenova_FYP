@@ -5,7 +5,7 @@ export const MAX_PRESENTATION_UPLOAD_BYTES = 50 * 1024 * 1024;
 
 // ─── Mode & Tone Options ─────────────────────────────────────────────────────
 
-export const PROCESSING_MODES = ['quick', 'professional', 'academic'] as const;
+export const PROCESSING_MODES = ['quick', 'professional', 'academic', 'refresh'] as const;
 export type ProcessingMode = typeof PROCESSING_MODES[number];
 
 export const WRITING_TONES = [

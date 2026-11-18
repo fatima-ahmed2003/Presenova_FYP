@@ -1,3 +1,4 @@
+﻿import './speech-polish';
 /**
  * SpeechAnalyzer Page (Presentation Coach)
  * Records speech with MediaRecorder and sends it to the backend for analysis.
@@ -6,7 +7,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import Button from '../components/Button';
-import { analyzeAudio, analyzeSpeech } from '../services/api';
+import { analyzeAudio } from '../services/api';
 import { SpeechMetrics } from '../types';
 import { downloadProgressReportPDF } from '../services/pdfGenerator';
 import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from 'recharts';
@@ -26,26 +27,135 @@ const renderHighlighted = (text: string): React.ReactNode[] => {
   );
 };
 
-// Sub-component: 7Cs Pie Chart
-const SevenCsPieChart: React.FC<{ scores?: any; overallScore?: number }> = ({ scores, overallScore = 70 }) => {
-  const defaultScores = {
-    Clear: Math.max(25, overallScore - 5),
-    Concise: Math.max(25, overallScore - 12),
-    Correct: Math.max(25, overallScore - 10),
-    Complete: Math.max(25, overallScore - 15),
-    Courteous: Math.min(100, overallScore + 5),
-    Concrete: Math.max(25, overallScore - 8),
-    Consistent: Math.max(25, overallScore - 14)
+const convertToMonoWav = async (audioBlob: Blob): Promise<Blob> => {
+  const audioContext = new AudioContext();
+  try {
+    const decoded = await audioContext.decodeAudioData(await audioBlob.arrayBuffer());
+    const sampleRate = 16000;
+    const frameCount = Math.ceil(decoded.duration * sampleRate);
+    if (frameCount <= 0) {
+      throw new Error('The recording contains no audio samples.');
+    }
+
+    const offlineContext = new OfflineAudioContext(1, frameCount, sampleRate);
+    const source = offlineContext.createBufferSource();
+    source.buffer = decoded;
+    source.connect(offlineContext.destination);
+    source.start();
+    const rendered = await offlineContext.startRendering();
+    const samples = rendered.getChannelData(0);
+    const dataSize = samples.length * 2;
+    const wav = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(wav);
+    const writeText = (offset: number, value: string) => {
+      for (let index = 0; index < value.length; index += 1) {
+        view.setUint8(offset + index, value.charCodeAt(index));
+      }
+    };
+
+    writeText(0, 'RIFF');
+    view.setUint32(4, 36 + dataSize, true);
+    writeText(8, 'WAVE');
+    writeText(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeText(36, 'data');
+    view.setUint32(40, dataSize, true);
+
+    for (let index = 0; index < samples.length; index += 1) {
+      const sample = Math.max(-1, Math.min(1, samples[index]));
+      view.setInt16(
+        44 + index * 2,
+        sample < 0 ? sample * 0x8000 : sample * 0x7fff,
+        true
+      );
+    }
+    return new Blob([wav], { type: 'audio/wav' });
+  } finally {
+    await audioContext.close();
+  }
+};
+
+interface WavDiagnostics {
+  durationSeconds: number;
+  byteSize: number;
+  sampleRate: number;
+  channels: number;
+  peak: number;
+  rms: number;
+}
+
+const inspectWavFile = async (file: File): Promise<WavDiagnostics> => {
+  const buffer = await file.arrayBuffer();
+  const view = new DataView(buffer);
+  const readText = (offset: number, length: number) =>
+    Array.from({ length }, (_, index) =>
+      String.fromCharCode(view.getUint8(offset + index))
+    ).join('');
+
+  if (
+    buffer.byteLength < 44 ||
+    readText(0, 4) !== 'RIFF' ||
+    readText(8, 4) !== 'WAVE' ||
+    view.getUint16(20, true) !== 1 ||
+    view.getUint16(34, true) !== 16
+  ) {
+    throw new Error('Generated WAV is not PCM16 audio.');
+  }
+
+  const channels = view.getUint16(22, true);
+  const sampleRate = view.getUint32(24, true);
+  const byteRate = view.getUint32(28, true);
+  const blockAlign = view.getUint16(32, true);
+  const dataSize = view.getUint32(40, true);
+  const dataStart = 44;
+  const dataEnd = dataStart + dataSize;
+  if (
+    channels < 1 ||
+    sampleRate < 1 ||
+    byteRate < 1 ||
+    blockAlign !== channels * 2 ||
+    dataSize % blockAlign !== 0 ||
+    dataEnd > buffer.byteLength
+  ) {
+    throw new Error('Generated WAV has invalid PCM data.');
+  }
+
+  let sumSquares = 0;
+  let peak = 0;
+  let sampleCount = 0;
+  for (let offset = dataStart; offset < dataEnd; offset += 2) {
+    const sample = view.getInt16(offset, true) / 32768;
+    const magnitude = Math.abs(sample);
+    sumSquares += sample * sample;
+    peak = Math.max(peak, magnitude);
+    sampleCount += 1;
+  }
+
+  return {
+    durationSeconds: dataSize / byteRate,
+    byteSize: file.size,
+    sampleRate,
+    channels,
+    peak,
+    rms: sampleCount ? Math.sqrt(sumSquares / sampleCount) : 0,
   };
-  const activeScores = scores || defaultScores;
+};
 
-  const normalizedScores: Record<string, number> = {};
-  Object.entries(activeScores).forEach(([key, val]) => {
-    const normalizedKey = key.charAt(0).toUpperCase() + key.slice(1);
-    normalizedScores[normalizedKey] = typeof val === 'number' ? val : 70;
-  });
-
-  const data = Object.entries(normalizedScores).map(([name, value]) => ({ name, value }));
+// Sub-component: 7Cs Pie Chart
+const SevenCsPieChart: React.FC<{ scores?: SpeechMetrics['seven_cs_scores'] }> = ({ scores }) => {
+  if (!scores) return null;
+  const data = Object.entries(scores)
+    .filter((entry): entry is [string, number] =>
+      typeof entry[1] === 'number' && Number.isFinite(entry[1])
+    )
+    .map(([name, value]) => ({ name, value }));
+  if (data.length === 0) return null;
 
   const COLORS = ['#4f46e5', '#10b981', '#f43f5e', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4'];
 
@@ -79,7 +189,6 @@ const SevenCsPieChart: React.FC<{ scores?: any; overallScore?: number }> = ({ sc
 const SpeechAnalyzer: React.FC = () => {
 
   // ===== STATE =====
-  const [v1Transcript, setV1Transcript] = useState('');
   const [v1Duration, setV1Duration] = useState(0);
   const [v1Analysis, setV1Analysis] = useState<SpeechMetrics | null>(null);
   const [analysisDate, setAnalysisDate] = useState<Date | null>(null);
@@ -90,6 +199,8 @@ const SpeechAnalyzer: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hasRecordedAudio, setHasRecordedAudio] = useState(false);
+  const [diagnosticAudioUrl, setDiagnosticAudioUrl] = useState<string | null>(null);
+  const [audioDiagnostics, setAudioDiagnostics] = useState<WavDiagnostics | null>(null);
 
   // ===== REFS FOR AUDIO RECORDING =====
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -111,6 +222,14 @@ const SpeechAnalyzer: React.FC = () => {
       }
     };
   }, []);
+
+  useEffect(() => {
+    return () => {
+      if (diagnosticAudioUrl) {
+        URL.revokeObjectURL(diagnosticAudioUrl);
+      }
+    };
+  }, [diagnosticAudioUrl]);
 
   // ===== TIMER EFFECT =====
   useEffect(() => {
@@ -146,10 +265,13 @@ const SpeechAnalyzer: React.FC = () => {
       setDuration(0);
       audioChunksRef.current = [];
       setHasRecordedAudio(false);
+      setDiagnosticAudioUrl(null);
+      setAudioDiagnostics(null);
+      let acquiredStream: MediaStream | null = null;
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        streamRef.current = stream;
-        const mediaRecorder = new MediaRecorder(stream);
+        acquiredStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        streamRef.current = acquiredStream;
+        const mediaRecorder = new MediaRecorder(acquiredStream);
         mediaRecorderRef.current = mediaRecorder;
         mediaRecorder.ondataavailable = (event) => {
           if (event.data.size > 0) {
@@ -166,6 +288,11 @@ const SpeechAnalyzer: React.FC = () => {
         mediaRecorder.start();
         setIsRecording(true);
       } catch (err) {
+        acquiredStream?.getTracks().forEach((track) => track.stop());
+        if (streamRef.current === acquiredStream) {
+          streamRef.current = null;
+        }
+        mediaRecorderRef.current = null;
         console.error('Microphone error:', err);
         setError('Microphone access denied or unavailable. Please connect a microphone and check permissions.');
       }
@@ -178,19 +305,26 @@ const SpeechAnalyzer: React.FC = () => {
       setError('Please record some speech audio first');
       return;
     }
+    setV1Analysis(null);
+    setV1Duration(0);
+    setAnalysisDate(null);
+    setDiagnosticAudioUrl(null);
+    setAudioDiagnostics(null);
     setLoading(true);
     setError(null);
     try {
       const mimeType = mediaRecorderRef.current?.mimeType || 'audio/webm';
-      const fileExt = mimeType.includes('webm') ? 'webm'
-      : mimeType.includes('ogg') ? 'ogg'
-      : mimeType.includes('mp4') ? 'm4a'
-      : 'wav';
       const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
-      const audioFile = new File([audioBlob], `speech.${fileExt}`, { type: mimeType });
+      const wavBlob = await convertToMonoWav(audioBlob);
+      const audioFile = new File([wavBlob], 'speech.wav', { type: 'audio/wav' });
+      setDiagnosticAudioUrl(URL.createObjectURL(audioFile));
+      try {
+        setAudioDiagnostics(await inspectWavFile(audioFile));
+      } catch {
+        console.warn('Speech Analyzer WAV diagnostics could not be calculated.');
+      }
       const result = await analyzeAudio(audioFile, duration);
       setV1Analysis(result);
-      setV1Transcript(result.transcript || '');
       setV1Duration(duration);
       setAnalysisDate(new Date());
     } catch (err) {
@@ -214,10 +348,11 @@ const SpeechAnalyzer: React.FC = () => {
     setIsRecording(false);
     setHasRecordedAudio(false);
     audioChunksRef.current = [];
-    setV1Transcript('');
     setV1Duration(0);
     setV1Analysis(null);
     setAnalysisDate(null);
+    setDiagnosticAudioUrl(null);
+    setAudioDiagnostics(null);
   };
 
   // ===== RESET ALL STATE =====
@@ -225,36 +360,32 @@ const SpeechAnalyzer: React.FC = () => {
     handleClear();
   };
 
-  const handleUseDemoSpeech = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const demoV1Text = "Hello everyone, today I want to talk about, you know, blockchain technology. Basically, blockchain is like a distributed ledger, and actually, it is very secure. Um, we can use it for smart contracts, and kind of, you know, supply chain tracking. But the main problem is scalability. Um, we need to find, you know, better consensus mechanisms. So, basically, that is my presentation. Any questions?";
-      const durationSecs = 30;
-
-      const result = await analyzeSpeech(demoV1Text, durationSecs);
-      setV1Analysis(result);
-      setV1Transcript(result.transcript || demoV1Text);
-      setV1Duration(durationSecs);
-      setAnalysisDate(new Date());
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to analyze demo speech');
-    } finally {
-      setLoading(false);
-    }
-  };
-
   const handleDownloadReport = () => {
     if (!v1Analysis) return;
-    const v1Score = v1Analysis.overall_score !== undefined ? v1Analysis.overall_score : v1Analysis.clarity_score;
-
-    const categoryScores = [
-      { name: 'Structure', v1: v1Analysis.category_scores?.Structure || 0, v2: v1Analysis.category_scores?.Structure || 0 },
-      { name: 'Clarity', v1: v1Analysis.category_scores?.Clarity || 0, v2: v1Analysis.category_scores?.Clarity || 0 },
-      { name: 'Persuasion', v1: v1Analysis.category_scores?.Persuasion || 0, v2: v1Analysis.category_scores?.Persuasion || 0 },
-      { name: 'Content Quality', v1: v1Analysis.category_scores?.Content_Quality || 0, v2: v1Analysis.category_scores?.Content_Quality || 0 },
-      { name: 'Call to Action', v1: v1Analysis.category_scores?.Call_to_Action || 0, v2: v1Analysis.category_scores?.Call_to_Action || 0 },
+    const v1Score = v1Analysis.overall_score;
+    const categoryRows = [
+      { name: 'Structure', score: v1Analysis.category_scores?.Structure },
+      { name: 'Clarity', score: v1Analysis.category_scores?.Clarity },
+      { name: 'Persuasion', score: v1Analysis.category_scores?.Persuasion },
+      { name: 'Content Quality', score: v1Analysis.category_scores?.Content_Quality },
+      { name: 'Call to Action', score: v1Analysis.category_scores?.Call_to_Action },
     ];
+    const categoryScores = categoryRows.map(({ name, score }) =>
+      typeof score === 'number' && Number.isFinite(score)
+        ? { name, v1: score, v2: score }
+        : null
+    );
+    if (
+      typeof v1Score !== 'number' ||
+      !Number.isFinite(v1Score) ||
+      categoryScores.some((score) => score === null)
+    ) {
+      setError('Complete score data is unavailable. No report was generated.');
+      return;
+    }
+    const completeCategoryScores = categoryScores.filter(
+      (score): score is NonNullable<typeof score> => score !== null
+    );
 
     downloadProgressReportPDF({
       title: 'Speech Analysis Report',
@@ -262,7 +393,7 @@ const SpeechAnalyzer: React.FC = () => {
       v1Score,
       v2Score: v1Score,
       gain: 0,
-      categoryScores,
+      categoryScores: completeCategoryScores,
       synthesis: v1Analysis.detailed_feedback || 'Your speech analysis is complete.',
       improvements: v1Analysis.recommendations || [],
       remaining: v1Analysis.actionable_feedback || [],
@@ -277,18 +408,18 @@ const SpeechAnalyzer: React.FC = () => {
   };
 
   // ===== RENDER REPORT =====
-  const renderSingleReport = (report: SpeechMetrics, elapsedSecs: number) => {
+  const renderSingleReport = (report: SpeechMetrics) => {
     const wpm = report.speech_speed_wpm;
     const paceText = wpm > 160 ? 'A little fast. Slow down for clarity.'
       : wpm < 100 ? 'A little slow. Try to pick up the pace.'
       : 'Good pace! You are speaking at a natural speed.';
-    const fillerCount = report.filler_words_count || 0;
+    const fillerCount = report.filler_words_count;
     const fillerText = fillerCount > 5 ? 'Try to reduce filler words for a smoother flow.' : 'Nice, very few filler words.';
     const clarity = report.clarity_score;
     const clarityText = clarity >= 80 ? 'Your message is clear and easy to follow.' : 'Work on making your message clearer.';
-    const overall = report.overall_score !== undefined ? report.overall_score : report.clarity_score;
-    const transcriptText = report.transcript || v1Transcript || '';
-    const wordCount = report.word_count || (transcriptText ? transcriptText.split(/\s+/).length : 0);
+    const overall = report.overall_score;
+    const transcriptText = report.transcript || '';
+    const wordCount = report.word_count;
 
     const tips: string[] =
       report.recommendations && report.recommendations.length > 0
@@ -386,7 +517,7 @@ const SpeechAnalyzer: React.FC = () => {
                 <h3>Transcript</h3>
                 <p>Your spoken words with filler words highlighted.</p>
               </div>
-              <span className="sa-card-meta">{wordCount} words · {report.duration_seconds || elapsedSecs}s</span>
+              <span className="sa-card-meta">{wordCount} words Â· {report.duration_seconds}s</span>
             </div>
             <div className="sa-transcript">
               {transcriptText ? renderHighlighted(transcriptText) : 'No transcript text available.'}
@@ -422,13 +553,15 @@ const SpeechAnalyzer: React.FC = () => {
         <div className="sa-summary-row">
           <div className="sa-card sa-score-card">
             <h3>Overall Score</h3>
-            <div className="sa-score-circle">{overall}</div>
+            <div className="sa-score-circle">
+              {typeof overall === 'number' && Number.isFinite(overall) ? overall : 'â€”'}
+            </div>
           </div>
           <div className="sa-card sa-summary-card">
             <h3>Speech Coach Summary</h3>
             <p>
               {report.detailed_feedback ||
-               `Your speech analysis is complete. You spoke ${report.word_count} words over ${report.duration_seconds || elapsedSecs} seconds at an average pace of ${report.speech_speed_wpm} WPM. Clarity was evaluated at ${report.clarity_score}/100 based on filler word density and repetition rates.`}
+               `Your speech analysis is complete. You spoke ${report.word_count} words over ${report.duration_seconds} seconds at an average pace of ${report.speech_speed_wpm} WPM. Clarity was evaluated at ${report.clarity_score}/100 based on filler word density and repetition rates.`}
             </p>
           </div>
         </div>
@@ -470,7 +603,7 @@ const SpeechAnalyzer: React.FC = () => {
                   );
                 })}
               </div>
-              <SevenCsPieChart scores={report.seven_cs_scores} overallScore={report.overall_score || report.clarity_score} />
+              <SevenCsPieChart scores={report.seven_cs_scores} />
             </div>
           </section>
         )}
@@ -545,23 +678,31 @@ const SpeechAnalyzer: React.FC = () => {
               <Button label="Clear" onClick={handleClear} variant="secondary" disabled={loading} />
             </>
           )}
-          {!isRecording && !hasRecordedAudio && !v1Analysis && (
-            <Button label="Load Demo Speech" onClick={handleUseDemoSpeech} variant="secondary" disabled={loading} />
-          )}
         </div>
+        {diagnosticAudioUrl && (
+          <div className="sa-audio-diagnostics">
+            <a href={diagnosticAudioUrl} download="speech-analyzer-diagnostic.wav">
+              Download exact WAV sent to backend
+            </a>
+            {audioDiagnostics && (
+              <p className="sa-muted">
+                Duration: {audioDiagnostics.durationSeconds.toFixed(2)}s Â·
+                {' '}Size: {audioDiagnostics.byteSize} bytes Â·
+                {' '}Sample rate: {audioDiagnostics.sampleRate} Hz Â·
+                {' '}Channels: {audioDiagnostics.channels} Â·
+                {' '}Peak: {audioDiagnostics.peak.toFixed(6)} Â·
+                {' '}RMS: {audioDiagnostics.rms.toFixed(6)}
+              </p>
+            )}
+          </div>
+        )}
       </section>
 
-      {v1Transcript && !v1Analysis && (
-        <section className="sa-card">
-          <h3 className="sa-section-title">Current Speech Transcript</h3>
-          <div className="sa-transcript">{v1Transcript}</div>
-        </section>
-      )}
-         {!v1Analysis && !v1Transcript && <SpeechIdle />}
+      {!v1Analysis && <SpeechIdle />}
 
       {v1Analysis && (
         <>
-          {renderSingleReport(v1Analysis, v1Duration)}
+          {renderSingleReport(v1Analysis)}
           <div className="sa-center">
             <Button label="Analyze New Speech" onClick={handleReset} variant="secondary" />
           </div>

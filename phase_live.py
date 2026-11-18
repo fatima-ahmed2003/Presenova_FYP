@@ -21,8 +21,11 @@ import base64
 import logging
 import math
 import re
+import statistics
 import tempfile
 import threading
+import time
+from collections import deque
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
@@ -52,40 +55,24 @@ MEDIAPIPE_AVAILABLE = False
 MEDIAPIPE_IMPORTED = False
 MEDIAPIPE_VERSION = None
 MEDIAPIPE_IMPORT_ERROR = None
-MEDIAPIPE_MODE = None  # "solutions" or "tasks"
+MEDIAPIPE_MODE = "tasks"
+mp = None
+mp_python = None
+mp_vision = None
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FACE_TASK_PATH = os.path.join(BASE_DIR, "cascades", "face_landmarker.task")
+POSE_TASK_PATH = os.path.join(BASE_DIR, "cascades", "pose_landmarker_lite.task")
+YUNET_MODEL_PATH = os.path.join(BASE_DIR, "cascades", "face_detection_yunet.onnx")
 
 try:
     import mediapipe as mp  # type: ignore
     MEDIAPIPE_IMPORTED = True
     MEDIAPIPE_VERSION = getattr(mp, "__version__", None)
 
-    # 1. Try legacy Solutions API (older MediaPipe)
-    if hasattr(mp, "solutions") and hasattr(mp.solutions, "face_mesh"):
-        mp_face_mesh = mp.solutions.face_mesh
-        mp_pose = getattr(mp.solutions, "pose", None)
-        MEDIAPIPE_AVAILABLE = True
-        MEDIAPIPE_MODE = "solutions"
-    else:
-        # 2. Modern MediaPipe Tasks API (MediaPipe >= 0.10.14 / 1.0+)
-        try:
-            from mediapipe.tasks import python as mp_python
-            from mediapipe.tasks.python import vision as mp_vision
-
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            task_paths = [
-                os.path.join(base_dir, "cascades", "face_landmarker.task"),
-                os.path.join(base_dir, "downloads", "face_landmarker.task"),
-            ]
-            task_model_path = next((p for p in task_paths if os.path.exists(p)), None)
-
-            if task_model_path:
-                MEDIAPIPE_AVAILABLE = True
-                MEDIAPIPE_MODE = "tasks"
-                MEDIAPIPE_IMPORT_ERROR = None
-            else:
-                MEDIAPIPE_IMPORT_ERROR = "MediaPipe face_landmarker.task model file not found."
-        except Exception as task_err:
-            MEDIAPIPE_IMPORT_ERROR = f"MediaPipe Tasks API unavailable: {str(task_err)}"
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision as mp_vision
+    MEDIAPIPE_AVAILABLE = True
+    MEDIAPIPE_IMPORT_ERROR = None if os.path.exists(FACE_TASK_PATH) else "cascades/face_landmarker.task model file not found."
 except Exception as e:
     MEDIAPIPE_IMPORT_ERROR = str(e)
     logger.warning("[LIVE WARN] MediaPipe not available: %s", MEDIAPIPE_IMPORT_ERROR)
@@ -120,144 +107,78 @@ phase_live_bp = Blueprint('phase_live', __name__, url_prefix='/api/presentation'
 # Minimum required samples to compute stable visual and audio averages
 MIN_VALID_VIDEO_SAMPLES = 3     # need at least 3 valid frames to trust visual presence
 MIN_VALID_AUDIO_SAMPLES = 1     # need at least 1 audio chunk to measure vocal delivery
-MIN_WORDS_PER_CHUNK = 2         # Whisper hallucinates 1-word phrases on silence/noise
+MIN_WORDS_PER_CHUNK = 3         # Match Speech Analyzer's minimum reliable transcript length.
 
 # ===== REAL-TIME FEATURE EXTRACTION FUNCTIONS =====
 
-face_cascade = None
-face_cascade_alt2 = None
-profile_cascade = None
-eye_cascade = None
-face_mesh_detector = None
-
-# ISSUE-17 / AUDIT-03: Reusable CLAHE instances to avoid per-frame C++ object allocation.
-# _CLAHE is used for the main preprocessing path (clipLimit 2.5).
-# _CLAHE_RETRY is used in the MediaPipe landmark-detection retry path (clipLimit 3.5)
-# so that neither branch allocates a new C++ object on every incoming video frame.
-_CLAHE = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)) if OPENCV_AVAILABLE else None
-_CLAHE_RETRY = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8)) if OPENCV_AVAILABLE else None
-
-_vision_lock = threading.Lock()
-_cascades_initialized = False
-
-def init_cascades():
-    global face_cascade, face_cascade_alt2, profile_cascade, eye_cascade, _cascades_initialized
-    if not OPENCV_AVAILABLE or _cascades_initialized:
-        return
-    with _vision_lock:
-        if _cascades_initialized:
-            return
-        try:
-            local_cascades = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cascades")
-            cascade_dir = getattr(cv2.data, "haarcascades", "")
-
-            def get_path(filename):
-                local = os.path.join(local_cascades, filename)
-                if os.path.exists(local):
-                    return local
-                system = os.path.join(cascade_dir, filename)
-                if os.path.exists(system):
-                    return system
-                return None
-
-            alt2_path = get_path("haarcascade_frontalface_alt2.xml")
-            default_path = get_path("haarcascade_frontalface_default.xml")
-            profile_path = get_path("haarcascade_profileface.xml")
-            eye_path = get_path("haarcascade_eye.xml")
-
-            if alt2_path:
-                face_cascade_alt2 = cv2.CascadeClassifier(alt2_path)
-            if default_path:
-                face_cascade = cv2.CascadeClassifier(default_path)
-            if profile_path:
-                profile_cascade = cv2.CascadeClassifier(profile_path)
-            if eye_path:
-                eye_cascade = cv2.CascadeClassifier(eye_path)
-
-            _cascades_initialized = True
-            logger.info("[LIVE OK] Haar Cascades loaded: alt2=%s, default=%s, eyes=%s",
-                        face_cascade_alt2 is not None, face_cascade is not None, eye_cascade is not None)
-        except Exception as e:
-            logger.warning("[LIVE WARN] Failed to load OpenCV cascades: %s", e)
-
-# Eagerly initialize cascades at module load so first frame doesn't encounter lock contention
-if OPENCV_AVAILABLE:
-    init_cascades()
-
+_vision_lock = threading.RLock()
 _session_lock = threading.Lock()
 _sid_to_session = {}
+_face_landmarker = None
+_pose_landmarker = None
+_yunet_detector = None
+_video_timestamp_ms = 0
 
 def create_face_mesh_detector():
-    """Creates an isolated MediaPipe FaceMesh / FaceLandmarker detector instance."""
-    if not MEDIAPIPE_AVAILABLE:
+    """Create the process-wide MediaPipe Tasks FaceLandmarker once at startup."""
+    if not MEDIAPIPE_AVAILABLE or not os.path.isfile(FACE_TASK_PATH):
         return None
+    options = mp_vision.FaceLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=FACE_TASK_PATH),
+        running_mode=mp_vision.RunningMode.VIDEO,
+        output_face_blendshapes=True,
+        output_facial_transformation_matrixes=True,
+        num_faces=1,
+        min_face_detection_confidence=0.35,
+        min_face_presence_confidence=0.35,
+        min_tracking_confidence=0.35,
+    )
+    return mp_vision.FaceLandmarker.create_from_options(options)
 
-    if MEDIAPIPE_MODE == "solutions":
-        try:
-            detector = mp_face_mesh.FaceMesh(
-                static_image_mode=True,
-                max_num_faces=1,
-                refine_landmarks=True,
-                min_detection_confidence=0.30,
-                min_tracking_confidence=0.30
-            )
-            logger.info("[LIVE OK] MediaPipe Solutions FaceMesh instance created.")
-            return detector
-        except Exception as e:
-            logger.warning("[LIVE WARN] Failed to init MediaPipe solutions FaceMesh: %s", e)
-            return None
-    elif MEDIAPIPE_MODE == "tasks":
-        try:
-            from mediapipe.tasks import python as mp_python
-            from mediapipe.tasks.python import vision as mp_vision
+def create_pose_detector():
+    """Create the process-wide MediaPipe Tasks PoseLandmarker Lite, if installed."""
+    if not MEDIAPIPE_AVAILABLE or not os.path.isfile(POSE_TASK_PATH):
+        return None
+    options = mp_vision.PoseLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=POSE_TASK_PATH),
+        running_mode=mp_vision.RunningMode.VIDEO,
+        num_poses=1,
+        min_pose_detection_confidence=0.4,
+        min_pose_presence_confidence=0.4,
+        min_tracking_confidence=0.4,
+    )
+    return mp_vision.PoseLandmarker.create_from_options(options)
 
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            task_paths = [
-                os.path.join(base_dir, "cascades", "face_landmarker.task"),
-                os.path.join(base_dir, "downloads", "face_landmarker.task"),
-            ]
-            task_model_path = next((p for p in task_paths if os.path.exists(p)), None)
-            if task_model_path:
-                base_options = mp_python.BaseOptions(model_asset_path=task_model_path)
-                options = mp_vision.FaceLandmarkerOptions(
-                    base_options=base_options,
-                    output_face_blendshapes=False,
-                    output_facial_transformation_matrixes=False,
-                    num_faces=1,
-                    min_face_detection_confidence=0.25,
-                    min_face_presence_confidence=0.25,
-                    min_tracking_confidence=0.25
-                )
-                detector = mp_vision.FaceLandmarker.create_from_options(options)
-                logger.info("[LIVE OK] MediaPipe Tasks FaceLandmarker instance created.")
-                return detector
-        except Exception as e:
-            logger.warning("[LIVE WARN] Failed to init MediaPipe Tasks FaceLandmarker: %s", e)
-            return None
-    return None
 
-_session_detectors = {}
+try:
+    _face_landmarker = create_face_mesh_detector()
+    if _face_landmarker is None:
+        logger.warning("[LIVE WARN] FaceLandmarker unavailable; expected cascades/face_landmarker.task")
+    _pose_landmarker = create_pose_detector()
+    if _pose_landmarker is None:
+        logger.warning("[LIVE WARN] PoseLandmarker Lite unavailable; expected cascades/pose_landmarker_lite.task")
+except Exception as detector_error:
+    MEDIAPIPE_IMPORT_ERROR = str(detector_error)
+    logger.exception("[LIVE WARN] MediaPipe Tasks initialization failed: %s", detector_error)
+
+if OPENCV_AVAILABLE and os.path.isfile(YUNET_MODEL_PATH):
+    try:
+        _yunet_detector = cv2.FaceDetectorYN.create(
+            YUNET_MODEL_PATH, "", (320, 240), 0.6, 0.3, 5000
+        )
+    except Exception as detector_error:
+        logger.warning("[LIVE WARN] YuNet fallback unavailable: %s", detector_error)
+
+_head_pose_samples = {}
+_gaze_calibration = {}
+_metric_smoothing = {}
+_head_pose_lock = threading.Lock()
 
 def get_session_detector_and_lock(session_id: str):
-    """
-    Retrieves or instantiates the per-session MediaPipe detector and its synchronization lock.
-    Stored in isolated _session_detectors mapping (completely decoupled from database models).
-    """
-    if not session_id:
-        session_id = "default_session"
-    session_id = str(session_id)
-    with _session_lock:
-        if session_id not in _session_detectors:
-            _session_detectors[session_id] = {
-                "lock": threading.Lock(),
-                "detector": create_face_mesh_detector(),
-            }
-        sess_entry = _session_detectors[session_id]
-        if "lock" not in sess_entry:
-            sess_entry["lock"] = threading.Lock()
-        if "detector" not in sess_entry or sess_entry["detector"] is None:
-            sess_entry["detector"] = create_face_mesh_detector()
-        return sess_entry.get("detector"), sess_entry["lock"]
+    return _face_landmarker, _vision_lock
+
+def get_session_pose_detector_and_lock(session_id: str):
+    return _pose_landmarker, _vision_lock
 
 def release_session_detector(session_id: str):
     """
@@ -266,16 +187,10 @@ def release_session_detector(session_id: str):
     if not session_id:
         return
     session_id = str(session_id)
-    with _session_lock:
-        sess_entry = _session_detectors.pop(session_id, None)
-        if sess_entry and "detector" in sess_entry and sess_entry["detector"] is not None:
-            try:
-                det = sess_entry["detector"]
-                if hasattr(det, "close"):
-                    det.close()
-                logger.info("[LIVE OK] Released MediaPipe detector for session %s...", session_id[:8])
-            except Exception as e:
-                logger.warning("[LIVE WARN] Error closing detector for session %s...: %s", session_id[:8], e)
+    with _head_pose_lock:
+        _head_pose_samples.pop(session_id, None)
+        _gaze_calibration.pop(session_id, None)
+        _metric_smoothing.pop(session_id, None)
 
 
 def init_face_mesh():
@@ -297,80 +212,90 @@ def _calculate_score_stability(values):
     return max(0.0, 1.0 - min(1.0, stddev / mean_value))
 
 
-def _calculate_confidence(eye_contact_score, posture_score, visibility_score=1.0, session=None):
-    if eye_contact_score <= 0 or posture_score <= 0 or visibility_score <= 0:
-        return 0
-
-    quality = math.sqrt((eye_contact_score / 100.0) * (posture_score / 100.0))
-    stability = 1.0
-    if session is not None:
-        eye_stability = _calculate_score_stability(session.metrics.get("eye_contact_scores", [])[-8:])
-        posture_stability = _calculate_score_stability(session.metrics.get("posture_scores", [])[-8:])
-        stability = (eye_stability + posture_stability) / 2.0
-
-    confidence = quality * stability * visibility_score
-    return _clip_score(confidence * 100, 0, 100)
-
-
-def _smooth_visual_scores(eye_contact_score, posture_score, session, face_detected=True):
-    if not face_detected or session is None:
-        return eye_contact_score, posture_score
-
-    prev_eyes = session.metrics.get("eye_contact_scores", [])[-4:]
-    prev_postures = session.metrics.get("posture_scores", [])[-4:]
-
-    # FIX: If eye contact is zero or low (looking away), drop immediately to zero/low!
-    # Do NOT smooth low scores with past high scores, otherwise zero eye contact is masked.
-    if eye_contact_score < 35:
-        smoothed_eye = eye_contact_score
-    elif prev_eyes:
-        avg_prev_eye = sum(prev_eyes) / len(prev_eyes)
-        if eye_contact_score < avg_prev_eye:
-            smoothed_eye = int(0.90 * eye_contact_score + 0.10 * avg_prev_eye)
-        else:
-            smoothed_eye = int(0.50 * eye_contact_score + 0.50 * avg_prev_eye)
-    else:
-        smoothed_eye = eye_contact_score
-
-    if posture_score < 35:
-        smoothed_posture = posture_score
-    elif prev_postures:
-        avg_prev_posture = sum(prev_postures) / len(prev_postures)
-        if posture_score < avg_prev_posture:
-            smoothed_posture = int(0.80 * posture_score + 0.20 * avg_prev_posture)
-        else:
-            smoothed_posture = int(0.50 * posture_score + 0.50 * avg_prev_posture)
-    else:
-        smoothed_posture = posture_score
-
-    return smoothed_eye, smoothed_posture
-
-
-def _visual_result(eye_contact_score, posture_score, hint, emotion=None, session=None, face_detected=True, visibility_score=1.0):
-    eye_contact_score, posture_score = _smooth_visual_scores(
-        _clip_score(eye_contact_score),
-        _clip_score(posture_score),
-        session,
-        face_detected=face_detected
+def _calculate_confidence(eye_contact_score=None, posture_score=None, head_movement_score=None, visibility_score=1.0):
+    # Keep the live proxy tied to the measured modalities. Renormalize only
+    # across measurements that actually exist for this frame.
+    measurements = (
+        (eye_contact_score, 0.4),
+        (posture_score, 0.3),
+        (head_movement_score, 0.3),
     )
-    confidence_score = _calculate_confidence(
-        eye_contact_score,
-        posture_score,
-        visibility_score=visibility_score,
-        session=session
-    ) if face_detected else 0
+    available = [(score, weight) for score, weight in measurements if score is not None]
+    total_weight = sum(weight for _, weight in available)
+    if total_weight <= 0:
+        return None
+    return _clip_score(sum(score * weight for score, weight in available) / total_weight, 0, 100)
 
-    if emotion is None:
-        if not face_detected:
-            emotion = "NOT DETECTED"
-        elif eye_contact_score >= 80 and posture_score >= 80:
-            emotion = "Confident"
-        elif eye_contact_score >= 65 and posture_score >= 65:
-            emotion = "Focused"
-        elif eye_contact_score < 45:
-            emotion = "Distracted"
-        else:
-            emotion = "Nervous"
+
+def _smooth_metric(session, metric, value, confidence):
+    if value is None or session is None:
+        return value, confidence
+    now = time.monotonic()
+    session_id = str(getattr(session, "id", ""))
+    with _head_pose_lock:
+        metrics = _metric_smoothing.setdefault(session_id, {})
+        samples = metrics.setdefault(metric, deque(maxlen=7))
+        samples.append((now, float(value)))
+        recent = [score for timestamp, score in samples if now - timestamp <= 3.0]
+        median_value = statistics.median(recent) if recent else float(value)
+        key = f"ema_{metric}"
+        ema = 0.4 * median_value + 0.6 * metrics.get(key, median_value)
+        metrics[key] = ema
+    return _clip_score(ema), confidence
+
+
+def _smooth_expression(session, expression):
+    if session is None or expression == "N/A":
+        return expression
+    session_id = str(getattr(session, "id", ""))
+    with _head_pose_lock:
+        metrics = _metric_smoothing.setdefault(session_id, {})
+        samples = metrics.setdefault("expression_labels", deque(maxlen=5))
+        samples.append(expression)
+        counts = {label: samples.count(label) for label in set(samples)}
+        return max(counts, key=counts.get)
+
+
+def _smooth_visual_scores(eye_contact_score, posture_score, session):
+    return (
+        _smooth_metric(session, "gaze", eye_contact_score, None)[0],
+        _smooth_metric(session, "posture", posture_score, None)[0],
+    )
+
+
+def _visual_result(
+    eye_contact_score,
+    posture_score,
+    hint,
+    session=None,
+    face_detected=True,
+    visibility_score=1.0,
+    gaze_method=None,
+    posture_method=None,
+    head_movement_score=None,
+    gaze_calibration_status="unavailable",
+    expression="N/A",
+    metric_confidence=None,
+):
+    eye_contact_score, posture_score = _smooth_visual_scores(
+        _clip_score(eye_contact_score) if eye_contact_score is not None else None,
+        _clip_score(posture_score) if posture_score is not None else None,
+        session
+    )
+    head_movement_score, head_confidence = _smooth_metric(session, "head", head_movement_score, (metric_confidence or {}).get("head_movement"))
+    if metric_confidence is None:
+        metric_confidence = {}
+    metric_confidence.update({
+        "eye_contact": metric_confidence.get("eye_contact") if eye_contact_score is not None else None,
+        "posture": metric_confidence.get("posture") if posture_score is not None else None,
+        "head_movement": head_confidence if head_movement_score is not None else None,
+        "expression": metric_confidence.get("expression") if expression != "N/A" else None,
+    })
+    confidence_score = _calculate_confidence(
+        eye_contact_score=eye_contact_score,
+        posture_score=posture_score,
+        head_movement_score=head_movement_score,
+    ) if face_detected else None
 
     return {
         "face_detected": face_detected,
@@ -381,21 +306,122 @@ def _visual_result(eye_contact_score, posture_score, hint, emotion=None, session
         "hint": hint,
         "confidence": confidence_score,
         "confidence_score": confidence_score,
-        "emotion": emotion,
+        "emotion": expression,
+        "expression": expression,
+        "expression_confidence": metric_confidence.get("expression"),
+        "metric_confidence": metric_confidence,
+        "gaze_method": gaze_method,
+        "posture_method": posture_method,
+        "head_movement": head_movement_score,
+        "head_movement_score": head_movement_score,
+        "gaze_calibration_status": gaze_calibration_status,
         "valid": face_detected
     }
 
 
-def _unmeasured_visual_result(hint):
+def _unmeasured_visual_result(hint, gaze_calibration_status="unavailable"):
     return {
         "face_detected": False,
-        "eye_contact_score": 0,
-        "posture_score": 0,
-        "confidence_score": 0,
+        "eye_contact": None,
+        "eye_contact_score": None,
+        "posture": None,
+        "posture_score": None,
+        "confidence": None,
+        "confidence_score": None,
+        "metric_confidence": {"eye_contact": None, "posture": None, "head_movement": None, "expression": None},
+        "expression": "N/A",
+        "face_detection_confidence": None,
+        "expression_confidence": None,
         "hint": hint,  # FIX: was missing, so the reason never reached the caller/frontend
-        "emotion": "NOT DETECTED",
+        "emotion": "N/A",
+        "gaze_method": None,
+        "posture_method": None,
+        "head_movement": None,
+        "head_movement_score": None,
+        "gaze_calibration_status": gaze_calibration_status,
         "valid": False
     }
+
+
+def _estimate_posture_score(pose_landmarks, frame_width, frame_height):
+    """Score shoulder tilt and head-to-shoulder centering from Pose Tasks landmarks."""
+    try:
+        points = pose_landmarks
+        left_shoulder, right_shoulder = points[11], points[12]
+        left_hip, right_hip = points[23], points[24]
+        nose = points[0]
+        required = (left_shoulder, right_shoulder, left_hip, right_hip, nose)
+        if any(min(getattr(p, "visibility", 0.0), getattr(p, "presence", 0.0)) < 0.45 for p in required):
+            return None, None
+        shoulder_span = math.hypot((right_shoulder.x-left_shoulder.x)*frame_width,
+                                   (right_shoulder.y-left_shoulder.y)*frame_height)
+        if shoulder_span < 1:
+            return None, None
+        shoulder_center_x = (left_shoulder.x + right_shoulder.x) / 2
+        shoulder_center_y = (left_shoulder.y + right_shoulder.y) / 2
+        hip_center_y = (left_hip.y + right_hip.y) / 2
+        torso_height = abs(hip_center_y - shoulder_center_y) * frame_height
+        if torso_height < 1:
+            return None, None
+        tilt = abs((right_shoulder.y-left_shoulder.y)*frame_height) / shoulder_span
+        head_offset = abs(nose.x - shoulder_center_x) * frame_width / shoulder_span
+        penalty = min(45, tilt * 100) + min(55, head_offset * 100)
+        confidence = _clip_score(sum(min(getattr(p, "visibility", 0.0), getattr(p, "presence", 0.0)) for p in required) / len(required) * 100)
+        return _clip_score(100 - penalty), confidence
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None, None
+
+
+def _estimate_head_pose(transformation_matrix):
+    """Convert MediaPipe's facial transformation matrix to yaw and pitch degrees."""
+    try:
+        matrix = np.asarray(transformation_matrix, dtype=np.float64).reshape(4, 4)[:3, :3]
+        sy = math.sqrt(matrix[0, 0] ** 2 + matrix[1, 0] ** 2)
+        if sy < 1e-6:
+            pitch = math.degrees(math.atan2(-matrix[1, 2], matrix[1, 1]))
+            yaw = math.degrees(math.atan2(-matrix[2, 0], sy))
+        else:
+            pitch = math.degrees(math.atan2(matrix[2, 1], matrix[2, 2]))
+            yaw = math.degrees(math.atan2(-matrix[2, 0], sy))
+        return (yaw, pitch) if math.isfinite(yaw) and math.isfinite(pitch) else None
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _measure_head_movement(session, pose):
+    if session is None or pose is None:
+        return None, None
+    session_id = str(getattr(session, "id", ""))
+    now = time.monotonic()
+    with _head_pose_lock:
+        samples = _head_pose_samples.setdefault(session_id, deque())
+        samples.append((now, pose[0], pose[1]))
+        while samples and now - samples[0][0] > 3.0:
+            samples.popleft()
+        if len(samples) < 4 or samples[-1][0] - samples[0][0] < 0.6:
+            return None, None
+        variation = math.hypot(statistics.pstdev(p[1] for p in samples), statistics.pstdev(p[2] for p in samples))
+        return _clip_score(100 - min(100, variation * 3.0)), 95
+
+
+def _calibrate_gaze(session, horizontal_ratio, vertical_ratio, blendshape_away=0.0):
+    if session is None or horizontal_ratio is None or vertical_ratio is None:
+        return None, "unavailable", None
+    session_id = str(getattr(session, "id", ""))
+    now = time.monotonic()
+    with _head_pose_lock:
+        state = _gaze_calibration.setdefault(session_id, {"started": now, "samples": deque(maxlen=48), "baseline": None})
+        if state["baseline"] is None:
+            state["samples"].append((horizontal_ratio, vertical_ratio))
+            elapsed = now - state["started"]
+            if elapsed >= 3.0 and len(state["samples"]) >= 5:
+                state["baseline"] = (statistics.median(p[0] for p in state["samples"]), statistics.median(p[1] for p in state["samples"]))
+            else:
+                return None, "calibrating", 70
+        baseline_h, baseline_v = state["baseline"]
+    iris_score = 100 - min(100, abs(horizontal_ratio-baseline_h)*240 + abs(vertical_ratio-baseline_v)*200)
+    score = 0.7 * iris_score + 0.3 * (100 - 100 * max(0.0, min(1.0, blendshape_away)))
+    return _clip_score(score), "calibrated", 85
 
 def _decode_frame(base64_image_data):
     if not OPENCV_AVAILABLE:
@@ -404,376 +430,149 @@ def _decode_frame(base64_image_data):
         base64_image_data = base64_image_data.split(",", 1)[1]
     img_bytes = base64.b64decode(base64_image_data)
     np_arr = np.frombuffer(img_bytes, np.uint8)
-    return cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
-def _analyze_frame_with_mediapipe(img, session=None):
-    if not MEDIAPIPE_AVAILABLE:
+    image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if image is None:
         return None
+    height, width = image.shape[:2]
+    if width > 480:
+        target_height = max(1, round(height * 480 / width))
+        image = cv2.resize(image, (480, target_height), interpolation=cv2.INTER_AREA)
+    return image
 
-    session_id = getattr(session, 'id', None) or (session if isinstance(session, str) else (session.get('id') if isinstance(session, dict) else 'default_session'))
-    detector, lock = get_session_detector_and_lock(session_id)
-    if detector is None:
-        return None
+def _blendshape_map(blendshapes):
+    return {item.category_name: float(item.score) for item in (blendshapes or [])}
 
-    h, w, _ = img.shape
-    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    landmarks = None
 
-    with lock:
-        if MEDIAPIPE_MODE == "solutions":
-            results = detector.process(rgb)
-            if results.multi_face_landmarks:
-                landmarks = results.multi_face_landmarks[0].landmark
-            else:
-                try:
-                    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-                    l_channel, a_channel, b_channel = cv2.split(lab)
-                    # Thread-safe CLAHE apply to prevent memory corruption
-                    with _vision_lock:
-                        cl = _CLAHE_RETRY.apply(l_channel) if _CLAHE_RETRY is not None else l_channel
-                    enhanced_bgr = cv2.cvtColor(cv2.merge((cl, a_channel, b_channel)), cv2.COLOR_LAB2BGR)
-                    enhanced_rgb = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2RGB)
-                    res_retry = detector.process(enhanced_rgb)
-                    if res_retry.multi_face_landmarks:
-                        landmarks = res_retry.multi_face_landmarks[0].landmark
-                except Exception:
-                    pass
-        elif MEDIAPIPE_MODE == "tasks":
-            try:
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                results = detector.detect(mp_image)
-                if results.face_landmarks:
-                    landmarks = results.face_landmarks[0]
-                else:
-                    try:
-                        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-                        l_channel, a_channel, b_channel = cv2.split(lab)
-                        # Thread-safe CLAHE apply to prevent memory corruption
-                        with _vision_lock:
-                            cl = _CLAHE_RETRY.apply(l_channel) if _CLAHE_RETRY is not None else l_channel
-                        enhanced_bgr = cv2.cvtColor(cv2.merge((cl, a_channel, b_channel)), cv2.COLOR_LAB2BGR)
-                        enhanced_rgb = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2RGB)
-                        mp_image_retry = mp.Image(image_format=mp.ImageFormat.SRGB, data=enhanced_rgb)
-                        res_retry = detector.detect(mp_image_retry)
-                        if res_retry.face_landmarks:
-                            landmarks = res_retry.face_landmarks[0]
-                    except Exception:
-                        pass
-            except Exception:
-                landmarks = None
-
-    if not landmarks:
-        # Crucial: return None so that Haar cascade detection with CLAHE runs as fallback!
-        return None
-
-    def point(index):
-        lm = landmarks[index]
-        return lm.x * w, lm.y * h
-
-    xs = [lm.x for lm in landmarks]
-    ys = [lm.y for lm in landmarks]
-    face_cx = ((min(xs) + max(xs)) / 2) * w
-    face_cy = ((min(ys) + max(ys)) / 2) * h
-    face_height_ratio = max(ys) - min(ys)
-    face_visibility = max(0.0, min(1.0, (face_height_ratio - 0.12) / 0.4))
-
-    left_eye_outer = point(33)
-    left_eye_inner = point(133)
-    right_eye_inner = point(362)
-    right_eye_outer = point(263)
-
-    left_eye_top = point(159)
-    left_eye_bottom = point(145)
-    right_eye_top = point(386)
-    right_eye_bottom = point(374)
-
-    left_eye_width = max(1.0, abs(left_eye_inner[0] - left_eye_outer[0]))
-    right_eye_width = max(1.0, abs(right_eye_outer[0] - right_eye_inner[0]))
-    left_eye_height = max(1.0, abs(left_eye_bottom[1] - left_eye_top[1]))
-    right_eye_height = max(1.0, abs(right_eye_bottom[1] - right_eye_top[1]))
-
-    # Eye Aspect Ratio (EAR) - detect closed eyes or looking straight down
-    left_ear = left_eye_height / left_eye_width
-    right_ear = right_eye_height / right_eye_width
-    avg_ear = (left_ear + right_ear) / 2.0
-
-    left_iris = [point(i) for i in range(468, 473)]
-    right_iris = [point(i) for i in range(473, 478)]
-    left_iris_x = sum(p[0] for p in left_iris) / len(left_iris)
-    right_iris_x = sum(p[0] for p in right_iris) / len(right_iris)
-    left_iris_y = sum(p[1] for p in left_iris) / len(left_iris)
-    right_iris_y = sum(p[1] for p in right_iris) / len(right_iris)
-
-    # Horizontal iris ratio (0.50 = perfectly centered)
-    left_h_ratio = (left_iris_x - min(left_eye_outer[0], left_eye_inner[0])) / left_eye_width
-    right_h_ratio = (right_iris_x - min(right_eye_inner[0], right_eye_outer[0])) / right_eye_width
-    gaze_h_dev = (abs(left_h_ratio - 0.50) + abs(right_h_ratio - 0.50)) / 2.0
-
-    # Vertical iris ratio (0.42 = looking directly at camera lens; >0.56 = looking down at screen/notes)
-    left_v_ratio = (left_iris_y - min(left_eye_top[1], left_eye_bottom[1])) / left_eye_height
-    right_v_ratio = (right_iris_y - min(right_eye_top[1], right_eye_bottom[1])) / right_eye_height
-    gaze_v_dev = (abs(left_v_ratio - 0.42) + abs(right_v_ratio - 0.42)) / 2.0
-
-    # Head orientation / turn deviation (Nose 1, Chin 152)
-    eye_center_x = (left_eye_outer[0] + right_eye_outer[0]) / 2.0
-    eye_center_y = (left_eye_outer[1] + right_eye_outer[1]) / 2.0
-    eye_span = max(1.0, abs(right_eye_outer[0] - left_eye_outer[0]))
-    face_len = max(1.0, abs(point(152)[1] - point(1)[1]))
-
-    head_yaw_dev = abs(point(1)[0] - eye_center_x) / eye_span
-    head_pitch_dev = abs((point(1)[1] - eye_center_y) / face_len - 0.55)
-
-    # FIX: The previous version used a binary "is_looking_away" gate that snapped
-    # eye_contact_score straight to 0 the instant ANY one of six tight thresholds
-    # (e.g. vertical iris ratio > 0.56) was crossed. On a typical laptop webcam
-    # — mounted above the screen, a few inches from the content the user is
-    # actually reading — normal screen-viewing gaze routinely exceeds those
-    # thresholds even while genuinely paying attention, so the score pinned to
-    # 0% almost permanently. Only fully closed eyes are a hard 0 now; gaze and
-    # head-angle deviation instead degrade the score continuously (same
-    # weighted-penalty style as the posture score below), with a wider
-    # tolerance band before penalties kick in.
-    eyes_closed = avg_ear < 0.16
-
-    if eyes_closed:
-        eye_contact_score = 0
-    else:
-        total_dev = (gaze_h_dev * 1.8) + (gaze_v_dev * 2.0) + (head_yaw_dev * 1.5) + (head_pitch_dev * 1.5)
-        eye_contact_score = _clip_score(100 - (total_dev * 110), 0, 100)
-        if total_dev > 0.55:
-            eye_contact_score = max(0, eye_contact_score - 20)
-
-    ideal_cx = w / 2
-    ideal_cy = h * 0.42
-    dev_x = abs(face_cx - ideal_cx) / w
-    dev_y = abs(face_cy - ideal_cy) / h
-
-    eye_dx = right_eye_outer[0] - left_eye_outer[0]
-    eye_dy = right_eye_outer[1] - left_eye_outer[1]
-    eye_tilt = abs(eye_dy) / max(1.0, abs(eye_dx))
-
-    size_penalty = 0
-    if face_height_ratio < 0.24:
-        size_penalty = (0.24 - face_height_ratio) * 130
-    elif face_height_ratio > 0.72:
-        size_penalty = (face_height_ratio - 0.72) * 100
-
-    posture_score = _clip_score(
-        100 - (dev_x * 130) - (dev_y * 115) - (eye_tilt * 180) - size_penalty,
-        0,
-        100
+def _map_expression(blendshapes):
+    values = _blendshape_map(blendshapes)
+    smile = (values.get('mouthSmileLeft', 0.0) + values.get('mouthSmileRight', 0.0)) / 2
+    tense = max(
+        (values.get('browDownLeft', 0.0) + values.get('browDownRight', 0.0)) / 2,
+        (values.get('mouthPressLeft', 0.0) + values.get('mouthPressRight', 0.0)) / 2,
+        (values.get('noseSneerLeft', 0.0) + values.get('noseSneerRight', 0.0)) / 2,
+        values.get('jawClench', 0.0),
     )
-
-    if posture_score < 70:
-        if dev_x > 0.15:
-            hint = "Center yourself in front of the camera."
-        elif face_height_ratio < 0.24:
-            hint = "Move closer so your face is clearly visible."
-        elif eye_tilt > 0.12:
-            hint = "Keep your head level and shoulders steady."
-        else:
-            hint = "Sit upright and keep a steady posture."
-    elif eye_contact_score < 70:
-        if gaze_v_dev > 0.15:
-            hint = "Look up at the camera lens instead of down at your notes."
-        else:
-            hint = "Look closer to the camera lens for stronger eye contact."
-    else:
-        hint = "Good eye contact and posture!"
-
-    return _visual_result(
-        eye_contact_score,
-        posture_score,
-        hint,
-        session=session,
-        face_detected=True,
-        visibility_score=face_visibility
-    )
+    if smile >= 0.25 and smile >= tense:
+        return 'smile', _clip_score(smile * 100)
+    if tense >= 0.25:
+        return 'tense', _clip_score(tense * 100)
+    return 'neutral', _clip_score((1.0 - max(smile, tense)) * 100)
 
 
-def _analyze_frame_with_haar(img, session=None):
-    if not _cascades_initialized:
-        init_cascades()
+def _gaze_ratios(landmarks):
+    def p(index):
+        return landmarks[index].x, landmarks[index].y
+    left_outer, left_inner = p(33), p(133)
+    right_inner, right_outer = p(362), p(263)
+    left_top, left_bottom = p(159), p(145)
+    right_top, right_bottom = p(386), p(374)
+    left_iris, right_iris = [p(i) for i in range(468, 473)], [p(i) for i in range(473, 478)]
+    left_c = (sum(v[0] for v in left_iris) / 5, sum(v[1] for v in left_iris) / 5)
+    right_c = (sum(v[0] for v in right_iris) / 5, sum(v[1] for v in right_iris) / 5)
+    lh = (left_c[0] - min(left_outer[0], left_inner[0])) / max(1e-5, abs(left_inner[0] - left_outer[0]))
+    rh = (right_c[0] - min(right_inner[0], right_outer[0])) / max(1e-5, abs(right_outer[0] - right_inner[0]))
+    lv = (left_c[1] - min(left_top[1], left_bottom[1])) / max(1e-5, abs(left_bottom[1] - left_top[1]))
+    rv = (right_c[1] - min(right_top[1], right_bottom[1])) / max(1e-5, abs(right_bottom[1] - right_top[1]))
+    return (lh + rh) / 2, (lv + rv) / 2
 
-    if face_cascade is None and face_cascade_alt2 is None:
-        return None
 
-    h, w, _ = img.shape
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
+def _next_video_timestamp_ms():
+    global _video_timestamp_ms
     with _vision_lock:
-        global _CLAHE
-        if _CLAHE is None and OPENCV_AVAILABLE:
-            _CLAHE = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-        enhanced_gray = _CLAHE.apply(gray) if _CLAHE is not None else gray
+        _video_timestamp_ms = max(_video_timestamp_ms + 1, int(time.monotonic() * 1000))
+        return _video_timestamp_ms
 
-        def _safe_detect(cascade, im, sf=1.15, mn=3, ms=(30, 30)):
-            if cascade is None or im is None:
-                return []
-            try:
-                res = cascade.detectMultiScale(im, scaleFactor=max(1.10, sf), minNeighbors=mn, minSize=ms)
-                return list(res) if len(res) > 0 else []
-            except Exception:
-                return []
 
-        faces = _safe_detect(face_cascade_alt2, enhanced_gray, sf=1.15, mn=3, ms=(30, 30))
+def _analyze_frame_with_tasks(img, session=None):
+    if not OPENCV_AVAILABLE or _face_landmarker is None:
+        return None
+    h, w = img.shape[:2]
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    timestamp = _next_video_timestamp_ms()
+    try:
+        with _vision_lock:
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            face_result = _face_landmarker.detect_for_video(mp_image, timestamp)
+            if not face_result.face_landmarks:
+                return None
+            landmarks = face_result.face_landmarks[0]
+            blendshapes = face_result.face_blendshapes[0] if face_result.face_blendshapes else []
+            matrices = face_result.facial_transformation_matrixes
+            transform = matrices[0] if matrices is not None and len(matrices) else None
+            pose_result = _pose_landmarker.detect_for_video(mp_image, timestamp) if _pose_landmarker is not None else None
+    except Exception as exc:
+        logger.warning('[LIVE WARN] MediaPipe Tasks frame processing failed: %s', exc)
+        return None
+    if len(landmarks) < 478:
+        return None
 
-        if len(faces) == 0:
-            faces = _safe_detect(face_cascade, enhanced_gray, sf=1.15, mn=3, ms=(30, 30))
+    face_height = max(p.y for p in landmarks) - min(p.y for p in landmarks)
+    face_visibility = max(0.0, min(1.0, (face_height - 0.08) / 0.35))
+    horizontal, vertical = _gaze_ratios(landmarks)
+    categories = _blendshape_map(blendshapes)
+    gaze_away = sum(categories.get(name, 0.0) for name in (
+        'eyeLookInLeft', 'eyeLookOutLeft', 'eyeLookUpLeft', 'eyeLookDownLeft',
+        'eyeLookInRight', 'eyeLookOutRight', 'eyeLookUpRight', 'eyeLookDownRight'
+    )) / 2
+    gaze, calibration_status, gaze_confidence = _calibrate_gaze(session, horizontal, vertical, gaze_away)
 
-        if len(faces) == 0:
-            faces = _safe_detect(face_cascade_alt2, gray, sf=1.15, mn=3, ms=(30, 30))
+    head_pose = _estimate_head_pose(transform) if transform is not None else None
+    head_score, head_confidence = _measure_head_movement(session, head_pose)
+    if head_score is not None:
+        head_confidence = _clip_score(90 * face_visibility)
 
-        if len(faces) == 0:
-            faces = _safe_detect(profile_cascade, enhanced_gray, sf=1.18, mn=3, ms=(30, 30))
+    pose_landmarks = pose_result.pose_landmarks[0] if pose_result and pose_result.pose_landmarks else None
+    posture, posture_confidence = _estimate_posture_score(pose_landmarks, w, h)
 
-        if len(faces) == 0:
-            eq_gray = cv2.equalizeHist(gray)
-            faces = _safe_detect(face_cascade_alt2, eq_gray, sf=1.15, mn=2, ms=(25, 25))
-            if len(faces) == 0:
-                faces = _safe_detect(face_cascade, eq_gray, sf=1.15, mn=2, ms=(25, 25))
-
-        if len(faces) == 0:
-            return _unmeasured_visual_result("Face not detected. Ensure adequate lighting and look at the camera.")
-
-        fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
-        face_cx = fx + fw / 2
-        face_cy = fy + fh / 2
-        ideal_cx = w / 2
-        ideal_cy = h * 0.35
-
-        dev_x = abs(face_cx - ideal_cx) / w
-        dev_y = (face_cy - ideal_cy) / h
-        face_height_ratio = fh / h
-
-        x_penalty = min(30, dev_x * 120)
-        y_penalty = min(40, dev_y * 133) if dev_y > 0 else min(15, abs(dev_y) * 75)
-        size_penalty = 0
-        if face_height_ratio < 0.2:
-            size_penalty = min(20, (0.2 - face_height_ratio) * 100)
-        elif face_height_ratio > 0.65:
-            size_penalty = min(15, (face_height_ratio - 0.65) * 80)
-
-        posture_score = _clip_score(100 - x_penalty - y_penalty - size_penalty, 0, 100)
-
-        face_roi_enhanced = enhanced_gray[fy:fy + fh, fx:fx + fw]
-        face_roi_gray = gray[fy:fy + fh, fx:fx + fw]
-        eyes = _safe_detect(eye_cascade, face_roi_enhanced, sf=1.12, mn=3, ms=(10, 10))
-        if len(eyes) == 0:
-            eyes = _safe_detect(eye_cascade, face_roi_gray, sf=1.12, mn=2, ms=(10, 10))
-
-    face_visibility = max(0.0, min(1.0, (fw * fh) / (w * h)))
-
-    if len(eyes) == 0:
-        # Face is clearly present! Position/posture is solid.
-        # Estimate eye contact based on head centering rather than dropping to 0.
-        centered_bonus = max(0, int(35 - dev_x * 100))
-        eye_contact_score = int(_clip_score(45 + centered_bonus, 30, 80))
-        hint = "Face detected. Look directly at the camera lens for optimal eye contact." if posture_score >= 70 else "Sit upright and look at the camera."
-        return _visual_result(
-            eye_contact_score,
-            posture_score,
-            hint,
-            emotion="Focused" if posture_score >= 70 else "Nervous",
-            session=session,
-            face_detected=True,
-            visibility_score=face_visibility
-        )
-
-    face_area = fw * fh
-    eye_metrics = []
-    for (ex, ey, ew, eh) in eyes:
-        eye_cx = ex + (ew / 2)
-        eye_cy = ey + (eh / 2)
-        area_ratio = (ew * eh) / face_area
-        visibility_score = max(0.0, min(1.0, (area_ratio - 0.01) / 0.04))
-        horizontal_offset = abs(eye_cx - (fw * 0.5)) / fw
-        vertical_offset = abs(eye_cy - (fh * 0.45)) / fh
-
-        # Pupil dark center detection inside eye ROI
-        gaze_dev_roi = 0.0
-        try:
-            eye_crop = face_roi_gray[ey:ey + eh, ex:ex + ew]
-            if eye_crop.size > 0:
-                blurred = cv2.GaussianBlur(eye_crop, (5, 5), 0)
-                _, _, min_loc, _ = cv2.minMaxLoc(blurred)
-                pupil_x, pupil_y = min_loc
-                pupil_h_ratio = pupil_x / float(max(1, ew))
-                pupil_v_ratio = pupil_y / float(max(1, eh))
-                gaze_dev_roi = abs(pupil_h_ratio - 0.50) + abs(pupil_v_ratio - 0.40)
-        except Exception:
-            gaze_dev_roi = 0.15
-
-        eye_metrics.append({
-            "cx": eye_cx,
-            "cy": eye_cy,
-            "w": ew,
-            "h": eh,
-            "visibility": visibility_score,
-            "horizontal_offset": min(1.0, horizontal_offset * 2),
-            "vertical_offset": min(1.0, vertical_offset * 3),
-            "gaze_dev": gaze_dev_roi
-        })
-
-    avg_gaze_dev = sum(e["gaze_dev"] for e in eye_metrics) / len(eye_metrics)
-    avg_center_offset = sum(e["horizontal_offset"] for e in eye_metrics) / len(eye_metrics)
-
-    if len(eye_metrics) == 1:
-        # Single eye detected (slight head turn or shadow)
-        dev_penalty = min(50, avg_gaze_dev * 200 + avg_center_offset * 30)
-        eye_contact_score = int(_clip_score(70 - dev_penalty, 25, 80))
-    elif avg_gaze_dev > 0.18 or avg_center_offset > 0.22:
-        # User is looking significantly away from camera
-        eye_contact_score = 20
+    expression, expression_confidence = _map_expression(blendshapes) if blendshapes else ('N/A', None)
+    if expression_confidence is not None:
+        expression_confidence = _clip_score(expression_confidence * face_visibility)
+        expression = _smooth_expression(session, expression)
+    if calibration_status == 'calibrating':
+        hint = 'Look toward the camera for gaze calibration to finish.'
+    elif posture is None:
+        hint = 'Face detected; posture needs visible shoulders and hips.'
+    elif gaze is None:
+        hint = 'Face detected; gaze calibration needs a few seconds of visible eyes.'
     else:
-        gaze_penalty = min(70, avg_gaze_dev * 180)
-        left_eye, right_eye = sorted(eye_metrics[:2], key=lambda e: e["cx"])
-        avg_visibility = (left_eye["visibility"] + right_eye["visibility"]) / 2
-        vertical_alignment = 1.0 - min(1.0, abs(left_eye["cy"] - right_eye["cy"]) / max(1.0, fh * 0.08))
-        symmetry = (
-            min(left_eye["w"], right_eye["w"]) / max(1.0, max(left_eye["w"], right_eye["w"])) +
-            min(left_eye["h"], right_eye["h"]) / max(1.0, max(left_eye["h"], right_eye["h"]))
-        ) / 2
-        eye_distance_ratio = abs(right_eye["cx"] - left_eye["cx"]) / max(1.0, fw)
-        expected_distance = 0.28
-        distance_alignment = 1.0 - min(1.0, abs(eye_distance_ratio - expected_distance) / expected_distance)
-
-        base_raw_score = 100 * (
-            0.35 * avg_visibility +
-            0.25 * (1.0 - avg_center_offset) +
-            0.20 * vertical_alignment +
-            0.10 * symmetry +
-            0.10 * distance_alignment
-        )
-        eye_contact_score = int(_clip_score(base_raw_score - gaze_penalty, 30, 100))
-
-    if posture_score < 70:
-        if dev_y > 0.15:
-            hint = "Sit upright! You are slouching."
-        elif dev_x > 0.15:
-            hint = "Center yourself in front of the camera."
-        elif face_height_ratio < 0.2:
-            hint = "Move a bit closer to the camera."
-        else:
-            hint = "Adjust your posture to sit straight."
-    elif eye_contact_score < 60:
-        hint = "Look directly into the camera lens."
-    else:
-        hint = "Good eye contact and posture!"
-
+        hint = 'Face, gaze, head pose and upper-body landmarks are being tracked.'
     return _visual_result(
-        eye_contact_score,
-        posture_score,
-        hint,
-        session=session,
-        face_detected=True,
-        visibility_score=face_visibility
+        gaze, posture, hint, session=session, face_detected=True, visibility_score=face_visibility,
+        gaze_method='mediapipe_tasks_iris_blendshapes' if gaze is not None else None,
+        posture_method='mediapipe_tasks_pose' if posture is not None else None,
+        head_movement_score=head_score, gaze_calibration_status=calibration_status,
+        expression=expression,
+        metric_confidence={
+            'eye_contact': _clip_score(gaze_confidence * face_visibility) if gaze_confidence is not None else None,
+            'posture': posture_confidence if posture is not None else None,
+            'head_movement': head_confidence if head_score is not None else None,
+            'expression': expression_confidence,
+        },
     )
+
+
+def _yunet_fallback(img):
+    if _yunet_detector is None:
+        return None
+    h, w = img.shape[:2]
+    try:
+        with _vision_lock:
+            _yunet_detector.setInputSize((w, h))
+            _, faces = _yunet_detector.detect(img)
+        if faces is None or not len(faces):
+            return None
+        face_confidence = _clip_score(float(max(faces, key=lambda row: row[2] * row[3])[14]) * 100)
+        result = _unmeasured_visual_result('YuNet detected a face; detailed face and pose landmarks are unavailable.')
+        result.update({'face_detected': True, 'valid': True, 'face_detection_confidence': face_confidence})
+        return result
+    except Exception as exc:
+        logger.warning('[LIVE WARN] YuNet fallback failed: %s', exc)
+        return None
 
 def analyze_webcam_frame(base64_image_data: str, session=None) -> dict:
     """
     Analyzes a base64 encoded video frame for eye contact and posture alignment.
-    Uses MediaPipe Face Mesh when available, with OpenCV Haar Cascades as a real fallback.
+    Uses MediaPipe Tasks and YuNet face detection fallback only.
     """
     if not base64_image_data:
         return _unmeasured_visual_result("No video signal was received.")
@@ -784,168 +583,123 @@ def analyze_webcam_frame(base64_image_data: str, session=None) -> dict:
             reason = OPENCV_IMPORT_ERROR or "OpenCV could not decode this frame."
             return _unmeasured_visual_result(f"Camera frame could not be processed: {reason}")
 
-        mediapipe_result = _analyze_frame_with_mediapipe(img, session)
-        if mediapipe_result is not None:
-            return mediapipe_result
+        tasks_result = _analyze_frame_with_tasks(img, session)
+        if tasks_result is not None:
+            return tasks_result
 
-        haar_result = _analyze_frame_with_haar(img, session)
-        if haar_result is not None:
-            return haar_result
+        yunet_result = _yunet_fallback(img)
+        if yunet_result is not None:
+            return yunet_result
 
-        return _unmeasured_visual_result("Face not detected. Ensure adequate lighting and look directly at the camera.")
+        return _unmeasured_visual_result("Face not detected. Ensure adequate lighting and look directly at the camera.", "calibrating")
     except Exception as e:
         logger.error("[LIVE ERROR] Frame processing failed: %s", e)
         return _unmeasured_visual_result("Camera analysis failed for this frame.")
 
 
-def analyze_audio_chunk(base64_audio_data: str, session_id: str = "live", transcript_hint: str = "") -> dict:
-    """
-    Processes voice chunks for pacing (WPM) and filler words.
-    Uses Groq Whisper API for real-time transcription if available,
-    optionally uses a client-provided transcript. If neither is available,
-    the chunk is marked as unmeasured instead of generating dummy values.
-    """
+def _detect_live_speech_activity(rms_samples, sample_period_ms=50):
+    """Apply the Speech Analyzer RMS gate to browser-sampled microphone levels."""
+    if not isinstance(rms_samples, (list, tuple)) or len(rms_samples) < 5:
+        return 'unsupported'
+    try:
+        levels = [float(value) for value in rms_samples]
+        if any(not math.isfinite(level) or level < 0 or level > 1 for level in levels):
+            return 'unsupported'
+        period = float(sample_period_ms) / 1000.0
+        if not math.isfinite(period) or period <= 0:
+            return 'unsupported'
+    except (TypeError, ValueError, OverflowError):
+        return 'unsupported'
+
+    noise_floor = sorted(levels)[int((len(levels) - 1) * 0.2)]
+    threshold = max(0.003, noise_floor * 2.5)
+    active_duration = sum(period for level in levels if level >= threshold)
+    total_duration = len(levels) * period
+    active_ratio = active_duration / total_duration if total_duration else 0
+    return 'silence' if active_duration < 0.25 or active_ratio < 0.02 else 'speech'
+
+
+def analyze_audio_chunk(
+    base64_audio_data: str,
+    session_id: str = 'live',
+    transcript_hint: str = '',
+    rms_samples=None,
+    rms_sample_period_ms=50,
+) -> dict:
+    """Validate real microphone activity and Whisper output before scoring a chunk."""
+    unavailable = {
+        'wpm': None, 'filler_word_detected': False, 'transcript': '',
+        'filler_count': 0, 'pitch_score': None,
+        'vocal_sentiment': 'Unavailable', 'valid': False,
+        'no_speech_detected': False, 'transcription_unavailable': True,
+    }
     if not base64_audio_data:
-        return {"wpm": 0, "filler_word_detected": False, "transcript": "", "filler_count": 0, "valid": False}
+        return unavailable
 
     try:
-        # Clean header
-        if "," in base64_audio_data:
-            base64_audio_data = base64_audio_data.split(",")[1]
-            
-        audio_bytes = base64.b64decode(base64_audio_data)
-        
-        transcript = ""
-        filler_count = 0
-        filler_detected = False
+        audio_payload = base64_audio_data.split(',', 1)[-1]
+        audio_bytes = base64.b64decode(audio_payload, validate=True)
+        if not audio_bytes:
+            return {**unavailable, 'no_speech_detected': True, 'transcription_unavailable': False}
+        signal_status = _detect_live_speech_activity(rms_samples, rms_sample_period_ms)
+        if signal_status == 'silence':
+            return {**unavailable, 'no_speech_detected': True, 'transcription_unavailable': False}
+        if signal_status != 'speech' or not groq_client:
+            return unavailable
+
+        transcript = ''
+        no_speech_probabilities = []
         temp_audio_path = None
-        
-        # 1. Use Groq Whisper STT if API key is set
-        if groq_client:
-            try:
-                # Save base64-decoded bytes to a temp file
-                # WebM is the format browser MediaRecorder outputs in useLiveSession.ts
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temp_audio:
-                    temp_audio.write(audio_bytes)
-                    temp_audio_path = temp_audio.name
-                
-                logger.info("🎙️ [LIVE STT] Transcribing 3s chunk using Groq Whisper...")
-                with open(temp_audio_path, "rb") as audio_file:
-                    transcription = groq_client.audio.transcriptions.create(
-                        file=(f"chunk_{session_id}.webm", audio_file.read()),
-                        model="whisper-large-v3",
-                        language="en"
-                    )
-                    transcript = transcription.text.strip()
-            except (RateLimitError, APITimeoutError) as rate_err:
-                logger.warning("⚠️ [LIVE STT] Groq Whisper chunk rate-limited or timed out (%s). Degraded response returned.", rate_err)
-                transcript = ""
-            except Exception as e:
-                logger.warning("[LIVE STT WARN] Groq Whisper chunk transcription failed: %s", e)
-                transcript = ""
-            finally:
-                # ISSUE-06: Ensure temporary audio file is always cleaned up
-                if temp_audio_path and os.path.exists(temp_audio_path):
-                    try:
-                        os.remove(temp_audio_path)
-                    except OSError as oe:
-                        logger.warning("⚠️ [LIVE WARN] Could not remove temp audio file: %s", oe)
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as temp_audio:
+                temp_audio.write(audio_bytes)
+                temp_audio_path = temp_audio.name
+            with open(temp_audio_path, 'rb') as audio_file:
+                result = groq_client.audio.transcriptions.create(
+                    file=(f'chunk_{session_id}.webm', audio_file.read()),
+                    model='whisper-large-v3',
+                    language='en',
+                    response_format='verbose_json',
+                    temperature=0.0,
+                )
+            raw_text = result.get('text') if isinstance(result, dict) else getattr(result, 'text', None)
+            if not isinstance(raw_text, str):
+                return unavailable
+            transcript = raw_text.strip()
+            raw_segments = result.get('segments') if isinstance(result, dict) else getattr(result, 'segments', None)
+            for segment in raw_segments if isinstance(raw_segments, (list, tuple)) else []:
+                probability = segment.get('no_speech_prob') if isinstance(segment, dict) else getattr(segment, 'no_speech_prob', None)
+                if isinstance(probability, (int, float)) and not isinstance(probability, bool) and math.isfinite(probability) and 0 <= probability <= 1:
+                    no_speech_probabilities.append(float(probability))
+        finally:
+            if temp_audio_path and os.path.exists(temp_audio_path):
+                try:
+                    os.remove(temp_audio_path)
+                except OSError:
+                    logger.warning('[LIVE WARN] Could not remove temporary audio chunk.')
 
-        if not transcript and transcript_hint:
-            transcript = transcript_hint.strip()
-        
-        # 2. Process real transcript if STT succeeded
-        if transcript:
-            words = transcript.split()
-            word_count = len([w for w in words if w.strip()])
-            logger.info("🎙️ [LIVE STT RESULT] Transcribed %d word(s)", word_count)
+        if not no_speech_probabilities or sum(no_speech_probabilities) / len(no_speech_probabilities) >= 0.6 or len(transcript.split()) < MIN_WORDS_PER_CHUNK:
+            return {**unavailable, 'no_speech_detected': True, 'transcription_unavailable': False}
 
-            # ── FIX: Whisper (and most Whisper-family models) is known to
-            # hallucinate short filler phrases ("you", "thank you", "bye")
-            # on silence or background noise. A 1-word transcript from a 3s
-            # chunk is almost never real speech — treat it as unmeasured
-            # instead of letting it produce a fake WPM/score.
-            if word_count < MIN_WORDS_PER_CHUNK:
-                logger.warning("[LIVE STT WARN] Discarding likely-hallucinated chunk transcript (%d word(s)).", word_count)
-                return {
-                    "wpm": 0,
-                    "filler_word_detected": False,
-                    "transcript": "",
-                    "filler_count": 0,
-                    "pitch_score": None,
-                    "vocal_sentiment": "Unavailable",
-                    "valid": False
-                }
-
-            # Pacing calculation: chunk size is 3 seconds, so WPM = word_count * 20
-            wpm = word_count * 20
-            
-            # Count filler words
-            filler_words = ['um', 'uh', 'erm', 'err', 'like', 'you know', 'basically', 'actually', 'kind of']
-            text_lower = transcript.lower()
-            for filler in filler_words:
-                pattern = r'\b' + re.escape(filler) + r'\b'
-                filler_count += len(re.findall(pattern, text_lower))
-            
-            filler_detected = (filler_count > 0)
-            
-            # Vocal pitch variation heuristic
-            pitch_score = 88
-            vocal_sentiment = "Expressive"
-            if wpm > 160:
-                pitch_score -= 15
-                vocal_sentiment = "Hurried"
-            elif wpm < 90:
-                pitch_score -= 10
-                vocal_sentiment = "Monotone"
-            
-            if filler_count > 1:
-                pitch_score -= min(15, filler_count * 5)
-                vocal_sentiment = "Anxious"
-
-            return {
-                "wpm": wpm,
-                "filler_word_detected": filler_detected,
-                "transcript": transcript,
-                "filler_count": filler_count,
-                "pitch_score": max(40, min(100, pitch_score)),
-                "vocal_sentiment": vocal_sentiment,
-                "valid": True
-            }
-
+        words = transcript.split()
+        wpm = len(words) * 20  # Each validated MediaRecorder chunk spans three seconds.
+        filler_words = ('um', 'uh', 'erm', 'err', 'like', 'you know', 'basically', 'actually', 'kind of')
+        filler_count = sum(len(re.findall(r'\b' + re.escape(filler) + r'\b', transcript.lower())) for filler in filler_words)
         return {
-            "wpm": 0,
-            "filler_word_detected": False,
-            "transcript": "",
-            "filler_count": 0,
-            "pitch_score": None,
-            "vocal_sentiment": "Unavailable",
-            "valid": False
+            'wpm': wpm, 'filler_word_detected': filler_count > 0,
+            'transcript': transcript, 'filler_count': filler_count,
+            'pitch_score': None, 'vocal_sentiment': 'Unavailable',
+            'valid': True, 'no_speech_detected': False, 'transcription_unavailable': False,
         }
-        
-    except Exception as e:
-        logger.error("[LIVE ERROR] Audio chunk analysis failed: %s", e)
-        return {
-            "wpm": 0,
-            "filler_word_detected": False,
-            "transcript": "",
-            "filler_count": 0,
-            "pitch_score": None,
-            "vocal_sentiment": "Unavailable",
-            "valid": False
-        }
-
+    except Exception as exc:
+        logger.warning('[LIVE STT WARN] Audio chunk validation/transcription failed: %s', exc)
+        return unavailable
 
 @phase_live_bp.route('/vision-status', methods=['GET'])
 def get_vision_status():
     """
     Reports native CV dependency status for debugging live webcam analysis.
     """
-    cascade_ready = False
-    if OPENCV_AVAILABLE:
-        init_cascades()
-        cascade_ready = face_cascade is not None and eye_cascade is not None
-
     return jsonify({
         "opencv_available": OPENCV_AVAILABLE,
         "opencv_version": cv2.__version__ if OPENCV_AVAILABLE else None,
@@ -955,10 +709,10 @@ def get_vision_status():
         "mediapipe_mode": MEDIAPIPE_MODE,
         "mediapipe_version": MEDIAPIPE_VERSION,
         "mediapipe_error": MEDIAPIPE_IMPORT_ERROR,
-        "haar_cascades_ready": cascade_ready,
-        "primary_analyzer": (
-            f"mediapipe_{MEDIAPIPE_MODE}" if MEDIAPIPE_AVAILABLE else ("opencv_haar" if cascade_ready else None)
-        )
+        "face_task_model_ready": os.path.isfile(FACE_TASK_PATH),
+        "pose_task_model_ready": os.path.isfile(POSE_TASK_PATH),
+        "yunet_fallback_ready": _yunet_detector is not None,
+        "primary_analyzer": "mediapipe_tasks" if _face_landmarker is not None else ("opencv_yunet" if _yunet_detector is not None else None),
     }), 200
 
 
@@ -1043,45 +797,54 @@ def init_socketio_events(socketio):
             return
             
         session = PresentationSession.get_by_id(session_id)
-        if not session or session.status != 'STREAMING':
+        if not session or session.status not in ('STREAMING', 'INTERRUPTED_Q&A'):
             return
+
+        session.increment_metric("video_frames_received")
 
         # Frame backpressure guard: If a previous frame is currently being processed
         # for this session, drop this frame immediately to avoid thread buildup and latency lag.
         session_id_str = str(session_id)
         with _active_frame_lock:
             if session_id_str in _active_frame_sessions:
+                session.increment_metric("video_frames_dropped")
                 return
             _active_frame_sessions.add(session_id_str)
 
         try:
-            # Analyze frame
             metrics = analyze_webcam_frame(frame_data, session)
+            session.increment_metric("video_frames_analyzed")
+            face_detected = metrics.get("face_detected", False)
+            if face_detected:
+                session.increment_metric("video_frames_with_face")
 
-            if not metrics.get("valid", False):
-                socketio.emit('realtime_feedback', {
-                    "face_detected": False,
-                    "eye_contact": 0,
-                    "posture": 0,
-                    "confidence": 0,
-                    "hint": metrics.get("hint", "Face was not detected. Ensure adequate lighting."),
-                    "emotion": metrics.get("emotion", "NOT DETECTED")
-                }, room=request.sid, namespace='/ws/live-session')
-                return
+            eye_score = metrics.get("eye_contact")
+            posture_score = metrics.get("posture")
+            head_movement_score = metrics.get("head_movement")
+            confidence_score = metrics.get("confidence")
+            if eye_score is not None:
+                session.update_metrics("eye_contact_scores", eye_score)
+                session.increment_metric("video_frames_with_gaze")
+            if posture_score is not None:
+                session.update_metrics("posture_scores", posture_score)
+                session.increment_metric("video_frames_with_posture")
+            if head_movement_score is not None:
+                session.update_metrics("head_movement_scores", head_movement_score)
+                session.increment_metric("video_frames_with_head_movement")
+            if confidence_score is not None:
+                session.update_metrics("confidence_scores", confidence_score)
             
-            # Save only measured values to DB.
-            session.update_metrics("eye_contact_scores", metrics["eye_contact"])
-            session.update_metrics("posture_scores", metrics["posture"])
-            session.update_metrics("confidence_scores", metrics["confidence"])
-            
-            # Send feedback in real-time
             socketio.emit('realtime_feedback', {
-                "face_detected": True,
-                "eye_contact": metrics["eye_contact"],
-                "posture": metrics["posture"],
-                "hint": metrics["hint"],
-                "confidence": metrics["confidence"],
-                "emotion": metrics["emotion"]
+                "face_detected": face_detected,
+                "eye_contact": eye_score,
+                "posture": posture_score,
+                "head_movement": head_movement_score,
+                "gaze_calibration_status": metrics.get("gaze_calibration_status", "unavailable"),
+                "hint": metrics.get("hint", "No visual metrics were available for this frame."),
+                "confidence": confidence_score,
+                "emotion": metrics.get("expression", "N/A"),
+                "expression": metrics.get("expression", "N/A"),
+                "metric_confidence": metrics.get("metric_confidence", {}),
             }, room=request.sid, namespace='/ws/live-session')
         finally:
             with _active_frame_lock:
@@ -1104,14 +867,18 @@ def init_socketio_events(socketio):
             return
             
         # Voice dynamics
-        voice_metrics = analyze_audio_chunk(audio_data, session_id, current_transcript)
+        voice_metrics = analyze_audio_chunk(
+            audio_data,
+            session_id,
+            current_transcript,
+            data.get('rms_samples'),
+            data.get('rms_sample_period_ms', 50),
+        )
         if voice_metrics.get("valid", False):
             session.update_metrics("wpm_history", voice_metrics["wpm"])
+            session.update_metrics("transcripts", voice_metrics["transcript"])
             if voice_metrics.get("pitch_score") is not None:
                 session.update_metrics("vocal_sentiment_scores", voice_metrics["pitch_score"])
-        
-        if voice_metrics.get("transcript"):
-            session.update_metrics("transcripts", voice_metrics["transcript"])
             
         if voice_metrics.get("filler_count", 0) > 0:
             session.increment_metric("fillers_detected", voice_metrics["filler_count"])
@@ -1196,8 +963,8 @@ Your question MUST sound like a tough, inquisitive university professor testing 
             return
 
         # Grade the answer like a senior academic examiner
-        grade_score = 75
-        feedback = "Answer recorded. Good effort."
+        grade_score = None
+        feedback = "Answer recorded, but automated grading was unavailable."
 
         if gemini_available:
             try:
@@ -1221,8 +988,13 @@ Return ONLY a single valid JSON object:
 }}"""
                 res_data = _gemini_provider.generate_structured(prompt=grading_prompt)
                 if res_data and isinstance(res_data, dict):
-                    grade_score = int(res_data.get("score", 75))
-                    feedback = res_data.get("feedback", "Articulate response.")
+                    score = int(res_data["score"])
+                    if not 0 <= score <= 100:
+                        raise ValueError("Grader returned a score outside the valid range.")
+                    grade_score = score
+                    generated_feedback = res_data.get("feedback")
+                    if isinstance(generated_feedback, str) and generated_feedback.strip():
+                        feedback = generated_feedback.strip()
             except Exception as e:
                 logger.warning("[LIVE WARN] Gemini grading failed: %s", e)
         
@@ -1295,6 +1067,7 @@ def submit_presentation():
         # ===== STEP 1: COMPILE SESSION METRICS =====
         eye_scores = session.metrics.get("eye_contact_scores", [])
         posture_scores = session.metrics.get("posture_scores", [])
+        head_movement_scores = session.metrics.get("head_movement_scores", [])
         wpm_history = session.metrics.get("wpm_history", [])
         fillers = session.metrics.get("fillers_detected", 0)
         interruptions = session.metrics.get("interruptions", [])
@@ -1308,24 +1081,52 @@ def submit_presentation():
 
         avg_eye = avg_or_zero(eye_scores)
         avg_posture = avg_or_zero(posture_scores)
-        avg_wpm = avg_or_zero(wpm_history)
+        avg_head_movement = avg_or_zero(head_movement_scores)
+        avg_wpm = avg_or_zero(wpm_history) if wpm_history else None
         avg_confidence = avg_or_zero(confidence_scores)
-        avg_vocal_pitch = avg_or_zero(vocal_sentiment_scores)
 
         qna_scores = [i["score"] for i in interruptions if i.get("score") is not None]
         avg_qna = avg_or_zero(qna_scores)
 
-        # ── FIX: gate each dimension behind a minimum sample count, not just
-        # "list is non-empty". One lucky frame or one hallucinated Whisper
-        # chunk should not be enough evidence to score a whole dimension.
-        has_enough_video = len(eye_scores) >= MIN_VALID_VIDEO_SAMPLES and len(posture_scores) >= MIN_VALID_VIDEO_SAMPLES
-        has_enough_audio = len(wpm_history) >= MIN_VALID_AUDIO_SAMPLES
+        has_enough_gaze = len(eye_scores) >= MIN_VALID_VIDEO_SAMPLES
+        has_enough_posture = len(posture_scores) >= MIN_VALID_VIDEO_SAMPLES
+        has_enough_head_movement = len(head_movement_scores) >= MIN_VALID_VIDEO_SAMPLES
+        has_enough_video = has_enough_gaze or has_enough_posture or has_enough_head_movement
+        has_valid_speech = bool(wpm_history and transcripts)
+        has_enough_audio = has_valid_speech and len(wpm_history) >= MIN_VALID_AUDIO_SAMPLES
+        if not has_enough_audio:
+            avg_wpm = None
+        has_tracking_proxy = len(confidence_scores) >= MIN_VALID_VIDEO_SAMPLES
 
-        visual_presence = int((avg_eye + avg_posture) / 2) if has_enough_video else None
+        # The final report uses the mean of the same per-frame weighted
+        # Visual Tracking values displayed live.
+        visual_presence = avg_confidence if has_tracking_proxy else None
         vocal_delivery = None
         if has_enough_audio:
             vocal_delivery = min(100, max(20, 100 - (fillers * 4) - abs(avg_wpm - 140) // 2))
         content_quality = avg_qna if qna_scores else None
+        video_frames_received = session.metrics.get("video_frames_received", 0)
+        video_frames_analyzed = session.metrics.get("video_frames_analyzed", 0)
+        video_frames_dropped = session.metrics.get("video_frames_dropped", 0)
+        video_frames_with_face = session.metrics.get("video_frames_with_face", 0)
+        video_frames_with_gaze = session.metrics.get("video_frames_with_gaze", 0)
+        video_frames_with_posture = session.metrics.get("video_frames_with_posture", 0)
+        valid_frame_coverage = (
+            round(video_frames_with_face * 100 / video_frames_received, 1)
+            if video_frames_received else 0
+        )
+        gaze_frame_coverage = (
+            round(video_frames_with_gaze * 100 / video_frames_received, 1)
+            if video_frames_received else 0
+        )
+        posture_frame_coverage = (
+            round(video_frames_with_posture * 100 / video_frames_received, 1)
+            if video_frames_received else 0
+        )
+        analyzed_frame_coverage = (
+            round(video_frames_analyzed * 100 / video_frames_received, 1)
+            if video_frames_received else 0
+        )
 
         # ===== SCORING FORMULA WITH WEIGHT RENORMALIZATION =====
         # Base weights: Visual Presence (0.35), Vocal Delivery (0.35), Content / Q&A Quality (0.30).
@@ -1343,12 +1144,12 @@ def submit_presentation():
             weighted_scores.append((content_quality, 0.30))
 
         total_weight = sum(weight for _, weight in weighted_scores)
-        if total_weight > 0:
+        if has_valid_speech and total_weight > 0:
             # Proportional weight redistribution: sum( score * (w / total_weight) )
             normalized_scores = [(score, weight / total_weight) for score, weight in weighted_scores]
             overall_execution = int(round(sum(score * norm_w for score, norm_w in normalized_scores)))
         else:
-            overall_execution = 0
+            overall_execution = None
 
         # ── FIX: explicit flag for "nothing measurable happened this session"
         # so the frontend can show "Insufficient data" instead of a bare 0/40
@@ -1359,26 +1160,118 @@ def submit_presentation():
         transcript_full = " ".join(transcripts)
 
         # ===== STEP 2: GENERATE 7Cs ANALYSIS VIA CENTRAL EVALUATOR =====
-        from ai_evaluator import evaluate_7cs
-        report_json = evaluate_7cs(
-            text=transcript_full,
-            module_type='live',
-            context_metrics={
-                "topic": session.topic,
-                "avg_eye": avg_eye,
-                "avg_posture": avg_posture,
-                "avg_wpm": avg_wpm,
-                "fillers": fillers,
-                "avg_qna": avg_qna,
-                "interruptions": interruptions,
-                "overall_execution": overall_execution,
-                "has_visual_metrics": has_enough_video,
-                "has_voice_metrics": has_enough_audio,
-                "has_qna_scores": bool(qna_scores)
+        if has_valid_speech:
+            from ai_evaluator import evaluate_7cs
+            report_json = evaluate_7cs(
+                text=transcript_full,
+                module_type='live',
+                context_metrics={
+                    "topic": session.topic,
+                    "avg_eye": avg_eye,
+                    "avg_posture": avg_posture,
+                    "avg_head_movement": avg_head_movement if has_enough_head_movement else None,
+                    "avg_wpm": avg_wpm,
+                    "fillers": fillers,
+                    "avg_qna": avg_qna,
+                    "interruptions": interruptions,
+                    "overall_execution": overall_execution,
+                    "has_visual_metrics": has_enough_video,
+                    "has_gaze_metrics": has_enough_gaze,
+                    "has_posture_metrics": has_enough_posture,
+                    "has_voice_metrics": has_enough_audio,
+                    "has_qna_scores": bool(qna_scores)
+                }
+            )
+        else:
+            dimensions = ("Clear", "Concise", "Correct", "Complete", "Courteous", "Concrete", "Consistent")
+            categories = ("Structure", "Clarity", "Persuasion", "Content_Quality", "Call_to_Action", "Grammar_and_Syntax", "Accuracy", "Tone_Appropriateness", "Audience_Alignment", "Purpose_Fulfillment")
+            report_json = {
+                "overall_score": None,
+                "category_scores": {name: None for name in categories},
+                "seven_cs_scores": {name: None for name in dimensions},
+                "seven_cs_evaluation": {name: "No speech detected — not scored." for name in dimensions},
+                "strengths": [],
+                "recommendations": [],
+                "detailed_feedback": "No speech detected. Speech-dependent scores and the overall presentation score were not calculated. Measured visual metrics are retained below.",
+                "improved_text": "No speech detected.",
+                "grammar_score": None,
+                "grammar_issues": [],
+                "grammar_issues_count": 0,
+                "grammar_check_status": "unavailable",
+                "qna_analysis": "No speech detected; Q&A was not included in the presentation score.",
             }
-        )
+        seven_cs_scores = report_json.get("seven_cs_scores")
+        if not isinstance(seven_cs_scores, dict):
+            seven_cs_scores = {}
+            report_json["seven_cs_scores"] = seven_cs_scores
+        seven_cs_evaluation = report_json.get("seven_cs_evaluation")
+        if not isinstance(seven_cs_evaluation, dict):
+            seven_cs_evaluation = {}
+            report_json["seven_cs_evaluation"] = seven_cs_evaluation
+
+        def mark_unscored(dimension, reason):
+            seven_cs_scores[dimension] = None
+            seven_cs_evaluation[dimension] = reason
+
+        if not has_enough_audio:
+            for dimension in ("Clear", "Concise", "Correct", "Courteous"):
+                mark_unscored(dimension, "Not scored — no valid microphone transcript was captured.")
+            report_json["grammar_score"] = None
+            report_json["grammar_issues"] = []
+            report_json["grammar_issues_count"] = 0
+            report_json["grammar_check_status"] = "unavailable"
+        elif report_json.get("grammar_check_status") != "success":
+            mark_unscored("Correct", "Not scored — the transcript grammar check was unavailable.")
+            report_json["grammar_score"] = None
+            category_scores = report_json.get("category_scores")
+            if isinstance(category_scores, dict):
+                category_scores["Grammar_and_Syntax"] = None
+        if not has_enough_audio and not qna_scores:
+            for dimension in ("Complete", "Concrete"):
+                mark_unscored(dimension, "Not scored — no transcript or graded Q&A evidence was available.")
+        mark_unscored("Consistent", "Not scored — temporal gaze/posture consistency is not calculated.")
+
+        category_scores = report_json.get("category_scores")
+        if isinstance(category_scores, dict):
+            if not has_enough_audio:
+                for category in ("Structure", "Clarity", "Call_to_Action"):
+                    category_scores[category] = None
+            if not has_enough_audio and not qna_scores:
+                category_scores["Content_Quality"] = None
+                category_scores["Persuasion"] = None
+
         report_json["overall_score"] = overall_execution
-        report_json["insufficient_data"] = not has_any_data  # FIX
+        report_json["insufficient_data"] = (not has_any_data) or (not has_valid_speech)
+        report_json["speech_status"] = "Speech detected" if has_valid_speech else "No speech detected"
+
+        video_feedback = []
+        if has_enough_gaze:
+            video_feedback.append(
+                "Your measured camera-facing gaze averaged "
+                f"{avg_eye}%; try returning your gaze to the camera more often."
+                if avg_eye < 65 else
+                f"Your measured camera-facing gaze averaged {avg_eye}%."
+            )
+        if has_enough_posture:
+            video_feedback.append(
+                "Your measured upper-body alignment averaged "
+                f"{avg_posture}%; keep your shoulders level and torso upright."
+                if avg_posture < 65 else
+                f"Your measured upper-body alignment averaged {avg_posture}%."
+            )
+        if has_enough_head_movement:
+            video_feedback.append(
+                "Your head steadiness averaged "
+                f"{avg_head_movement}%; reduce frequent head shifts while addressing the camera."
+                if avg_head_movement < 65 else
+                f"Your measured head steadiness averaged {avg_head_movement}%."
+            )
+        report_json["video_feedback"] = video_feedback
+        if video_feedback:
+            recommendations = report_json.get("recommendations")
+            if not isinstance(recommendations, list):
+                recommendations = []
+            report_json["recommendations"] = recommendations + video_feedback
 
         # Context Memory Matrix: Fetch past reports for this topic to check progress
         past_reports = HistoricalReport.get_by_user_and_topic(user_id, session.topic)
@@ -1386,45 +1279,74 @@ def submit_presentation():
         comparison = {
             "improved": False,
             "difference": 0,
-            "note": "First session on this topic recorded. Great start!"
+            "note": "No prior comparable session is available for this topic."
         }
         
         if past_reports:
-            last_overall = past_reports[0].report_json.get("overall_score", 0)
-            diff = report_json["overall_score"] - last_overall
-            comparison = {
-                "improved": diff > 0,
-                "difference": diff,
-                "note": f"Your score shifted from {last_overall} to {report_json['overall_score']}. " + 
-                        ("Keep polishing your delivery!" if diff <= 0 else "Great improvements in eye contact and presentation flow!")
-            }
+            last_report = past_reports[0].report_json
+            if not last_report.get("insufficient_data", False):
+                last_overall = last_report.get("overall_score")
+                if isinstance(last_overall, (int, float)) and report_json["overall_score"] is not None:
+                    diff = report_json["overall_score"] - last_overall
+                    comparison = {
+                        "improved": diff > 0,
+                        "difference": diff,
+                        "note": f"Your score shifted from {last_overall} to {report_json['overall_score']} using the measurements available in each session."
+                    }
 
         # FIX: don't present a misleading "progress" comparison when this
         # session (or the prior one) had no real measured data.
-        if not has_any_data:
+        if not has_valid_speech:
             comparison = {
                 "improved": False,
                 "difference": 0,
-                "note": "No usable camera or voice data was captured this session. Make sure your camera and mic are on, then try again."
+                "note": "No speech detected. The overall presentation score is unavailable; measured visual metrics are retained."
+            }
+        elif not has_any_data:
+            comparison = {
+                "improved": False,
+                "difference": 0,
+                "note": "No measurable camera, microphone, or graded Q&A data was captured this session."
             }
 
         report_json["comparison"] = comparison
         report_json["topic"] = session.topic
         report_json["session_metrics"] = {
-            "avg_eye_contact": avg_eye,
-            "avg_posture": avg_posture,
-            "avg_wpm": avg_wpm,
-            "total_fillers": fillers,
+            "avg_eye_contact": avg_eye if has_enough_gaze else None,
+            "avg_posture": avg_posture if has_enough_posture else None,
+            "avg_head_movement": avg_head_movement if has_enough_head_movement else None,
+            "avg_wpm": avg_wpm if has_enough_audio else None,
+            "total_fillers": fillers if has_enough_audio else None,
             "interruptions_handled": len(interruptions),
-            "avg_confidence": avg_confidence,
-            "avg_vocal_pitch": avg_vocal_pitch,
+            "avg_confidence": avg_confidence if has_tracking_proxy else None,
+            "avg_vocal_pitch": None,
             "data_quality": {
                 "video_samples": len(eye_scores),
+                "video_frames_received": video_frames_received,
+                "video_frames_analyzed": video_frames_analyzed,
+                "video_frames_dropped": video_frames_dropped,
+                "video_frames_with_face": video_frames_with_face,
+                "video_frames_with_gaze": video_frames_with_gaze,
+                "video_frames_with_posture": video_frames_with_posture,
+                "head_movement_samples": len(head_movement_scores),
+                "valid_frame_coverage": valid_frame_coverage,
+                "gaze_frame_coverage": gaze_frame_coverage,
+                "posture_frame_coverage": posture_frame_coverage,
+                "analyzed_frame_coverage": analyzed_frame_coverage,
+                "gaze_samples": len(eye_scores),
+                "posture_samples": len(posture_scores),
+                "tracking_proxy_samples": len(confidence_scores),
                 "audio_samples": len(wpm_history),
+                "pitch_samples": 0,
                 "transcript_segments": len(transcripts),
                 "qna_scores": len(qna_scores),
                 "has_video_metrics": has_enough_video,
+                "has_gaze_metrics": has_enough_gaze,
+                "has_posture_metrics": has_enough_posture,
+                "has_head_movement_metrics": has_enough_head_movement,
+                "has_tracking_proxy": has_tracking_proxy,
                 "has_audio_metrics": has_enough_audio,
+                "has_pitch_metrics": False,
                 "has_qna_scores": bool(qna_scores),
                 "min_video_samples_required": MIN_VALID_VIDEO_SAMPLES,   # FIX
                 "min_audio_samples_required": MIN_VALID_AUDIO_SAMPLES,   # FIX

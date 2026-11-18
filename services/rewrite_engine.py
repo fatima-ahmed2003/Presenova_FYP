@@ -199,9 +199,11 @@ def run_rewrite_pipeline(
         logger.warning('[rewrite_engine] AI provider is NOT available; rule-based fallback will be used.')
         steps.append('AI provider unavailable — using rule-based fallback')
     fallback = FallbackManager(primary_provider=provider)
-    planner = RewritePlanner(mode=mode, tone=tone)
+    refresh_mode = (mode == 'refresh')  # REFRESH_MODE
+    planner_mode = 'professional' if refresh_mode else mode
+    planner = RewritePlanner(mode=planner_mode, tone=tone)
     smart_filter = SmartFilter()
-    executor = RewriteExecutor(provider=provider, planner=planner, smart_filter=smart_filter)
+    executor = RewriteExecutor(provider=provider, planner=planner, smart_filter=smart_filter, refresh=refresh_mode)
 
     holistic_analyzer = HolisticAnalyzer(provider=provider)
     per_slide_analyzer = PerSlideAnalyzer(provider=provider)
@@ -226,7 +228,7 @@ def run_rewrite_pipeline(
 
     # ── Step 6: Quality analysis ───────────────────────────────────────
     quality_scores = per_slide_analyzer.analyze_presentation(
-        extracted_text, original_filename, mode
+        extracted_text, original_filename, planner_mode
     )
     if not isinstance(quality_scores, dict):
         quality_scores = {}
@@ -262,12 +264,17 @@ def run_rewrite_pipeline(
         slides, grammar_summary, presentation_context,
         focus_items=focus_items,
     )
+    # GAP_DETECTOR
+    rewrite_metrics['ai_failed'] = (
+        rewrite_metrics.get('slides_rewritten', 0) > 0
+        and rewrite_metrics.get('ai_slides_succeeded', 0) == 0
+    )
 
     # ── Step 9b: Cross-slide consistency pass (no AI call, never fatal) ─
     # Same source typo must be corrected the same way on every slide.
     consistency_fixes = 0
     try:
-        rewritten_slides, consistency_log = harmonize_slides(slides, rewritten_slides)
+        rewritten_slides, consistency_log = (harmonize_slides(slides, rewritten_slides) if not refresh_mode else (rewritten_slides, []))
         consistency_fixes = len(consistency_log)
         if consistency_fixes:
             logger.info(
@@ -278,7 +285,7 @@ def run_rewrite_pipeline(
         logger.warning('[rewrite_engine] Consistency pass skipped (non-fatal): %s', exc)
     # Footers / running text must read identically on every slide.
     try:
-        rewritten_slides, footer_log = harmonize_footers(rewritten_slides)
+        rewritten_slides, footer_log = (harmonize_footers(rewritten_slides) if not refresh_mode else (rewritten_slides, []))
         if footer_log:
             consistency_fixes += len(footer_log)
             logger.info(
@@ -426,6 +433,12 @@ def run_rewrite_pipeline(
         rewrite_metrics=rewrite_metrics,
         analysis_ok=analysis_ok,
     )
+
+    if refresh_mode:  # REFRESH_MODE
+        improvements.append('Refresh mode: generic filler was replaced with topic-specific content; design was not changed.')
+        pics = sum(int(s.get('images', 0) or 0) for s in slides)
+        if pics:
+            improvements.append(f'{pics} picture(s) / chart image(s) were kept unchanged - replace any chart image that still shows placeholder figures.')
 
     return {
         'output_filename': output_filename,
@@ -600,6 +613,14 @@ def _build_improvements_summary(
 
     if total == 0:
         return ['No editable text was found in this presentation.']
+    # GAP_DETECTOR
+    if rewrite_metrics.get('ai_failed'):
+        return [
+            'The AI could not rewrite this deck (quota or timeout). '
+            'The file contains only minor rule-based edits. Please retry in a few minutes.'
+        ]
+    if rewrite_metrics.get('no_gaps_found'):
+        return ['No content gaps were found, so no slides were rewritten.']
     if changed == 0:
         return ['No text changes were needed — the existing wording was kept.']
 

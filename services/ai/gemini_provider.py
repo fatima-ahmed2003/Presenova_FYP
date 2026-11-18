@@ -135,6 +135,7 @@ class GeminiProvider(AIProvider):
         self.model_candidates = deduped
 
         self._dead_models: set[str] = set()
+        self._cooldown: dict = {}  # RATE_LIMIT_FIX: model -> time until it may be used again
         self.last_error: Optional[Exception] = None
         self.last_structured_error: Optional[dict] = None
 
@@ -215,6 +216,8 @@ class GeminiProvider(AIProvider):
 
         for attempt in range(self.max_retries + 1):
             models = [m for m in self.model_candidates if m not in self._dead_models]
+            _now = time.time()  # RATE_LIMIT_FIX
+            models = [m for m in models if self._cooldown.get(m, 0) <= _now] or models
             if not models:
                 logger.error("[gemini_provider] No usable models left (all returned NOT_FOUND). "
                              "Set GEMINI_MODEL in .env to a model your key can use.")
@@ -242,7 +245,10 @@ class GeminiProvider(AIProvider):
                         "[gemini_provider] Attempt %d with %s failed: %s",
                         attempt + 1, model_name, message[:300],
                     )
-                    if _is_not_found(message):
+                    if _is_rate_limited(message):  # RATE_LIMIT_FIX: check first, a 429 body can contain '404'
+                        rate_limited = True
+                        self._cooldown[model_name] = time.time() + 90
+                    elif _is_not_found(message):
                         self._dead_models.add(model_name)
                         logger.error("[gemini_provider] Model %r not found; removing it from candidates.", model_name)
                     elif _is_rate_limited(message):

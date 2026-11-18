@@ -40,7 +40,15 @@ _TIMEOUT = 1.5
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def check_grammar(text: str, language: str = 'en-US') -> list[dict]:
+class GrammarCheckResult(list[dict]):
+    """List-compatible grammar matches with an explicit check outcome."""
+
+    def __init__(self, matches: list[dict] | None = None, status: str = 'success'):
+        super().__init__(matches or [])
+        self.status: str = status
+
+
+def check_grammar(text: str, language: str = 'en-US') -> GrammarCheckResult:
     """
     Send text to LanguageTool Cloud REST API and return a list of grammar issues:
       {
@@ -53,14 +61,14 @@ def check_grammar(text: str, language: str = 'en-US') -> list[dict]:
         "replacements": list[str]  # top-3 suggested fixes
       }
 
-    Returns an empty list if the API is disabled, text is too short,
-    or the request fails (graceful degradation in <1.5s).
+    The list-compatible result has a `status` attribute to distinguish an
+    empty successful check from a disabled, skipped, or failed check.
     """
     if not _CLOUD_ENABLED:
-        return []
+        return GrammarCheckResult(status='disabled')
 
     if not text or len(text.strip()) < 10:
-        return []
+        return GrammarCheckResult(status='skipped')
 
     # ── Build request payload ─────────────────────────────────────────────────
     payload: dict = {
@@ -74,7 +82,6 @@ def check_grammar(text: str, language: str = 'en-US') -> list[dict]:
         payload['username'] = LANGUAGETOOL_USERNAME
 
     # ── Call LanguageTool Cloud API with tight timeout ───────────────────────
-    data = {}
     try:
         response = requests.post(
             f'{LANGUAGETOOL_API_URL}/check',
@@ -82,32 +89,67 @@ def check_grammar(text: str, language: str = 'en-US') -> list[dict]:
             timeout=_TIMEOUT,
             headers={'Accept': 'application/json'}
         )
-        if response.status_code == 200:
-            data = response.json()
+        if response.status_code != 200:
+            logger.info(
+                '[language_tool_service] LanguageTool API returned HTTP %s.',
+                response.status_code,
+            )
+            return GrammarCheckResult(status='http_error')
     except requests.exceptions.Timeout:
         logger.info('[language_tool_service] LanguageTool API timeout (<1.5s). Continuing smoothly.')
-        return []
+        return GrammarCheckResult(status='timeout')
     except requests.exceptions.ConnectionError:
         logger.info('[language_tool_service] LanguageTool API unreachable. Continuing smoothly.')
-        return []
+        return GrammarCheckResult(status='connection_error')
     except Exception as exc:
         logger.warning(f'[language_tool_service] Grammar check notice: {exc}')
-        return []
+        return GrammarCheckResult(status='error')
+
+    try:
+        data = response.json()
+    except Exception as exc:
+        logger.warning('[language_tool_service] Invalid LanguageTool response: %s', exc)
+        return GrammarCheckResult(status='invalid_response')
+
+    if not isinstance(data, dict) or not isinstance(data.get('matches'), list):
+        logger.warning('[language_tool_service] Invalid LanguageTool response schema.')
+        return GrammarCheckResult(status='invalid_response')
 
     # ── Parse response ────────────────────────────────────────────────────────
-    matches = data.get('matches', [])
+    matches = data['matches']
     results = []
     for m in matches:
-        rule       = m.get('rule', {})
-        context    = m.get('context', {})
+        if not isinstance(m, dict):
+            logger.warning('[language_tool_service] Invalid LanguageTool match schema.')
+            return GrammarCheckResult(status='invalid_response')
+
+        rule = m.get('rule', {})
+        context = m.get('context', {})
         replacements_raw = m.get('replacements', [])
+        if (
+            not isinstance(rule, dict)
+            or not isinstance(context, dict)
+            or not isinstance(replacements_raw, list)
+            or not all(
+                isinstance(replacement, dict)
+                and ('value' not in replacement or isinstance(replacement['value'], str))
+                for replacement in replacements_raw
+            )
+        ):
+            logger.warning('[language_tool_service] Invalid LanguageTool match details.')
+            return GrammarCheckResult(status='invalid_response')
+
+        category = rule.get('category', {})
+        if not isinstance(category, dict):
+            logger.warning('[language_tool_service] Invalid LanguageTool category schema.')
+            return GrammarCheckResult(status='invalid_response')
 
         # Extract top-3 replacement suggestions
         suggestions = [r.get('value', '') for r in replacements_raw[:3] if r.get('value')]
 
         results.append({
             'rule_id':      rule.get('id', 'unknown'),
-            'category':     rule.get('category', {}).get('name', ''),
+            'category':     category.get('name', ''),
             'message':      m.get('message', ''),
             'context':      context.get('text', ''),
             'offset':       m.get('offset', 0),
@@ -116,7 +158,7 @@ def check_grammar(text: str, language: str = 'en-US') -> list[dict]:
         })
 
     logger.info(f'[language_tool_service] Found {len(results)} grammar issues via Cloud API.')
-    return results
+    return GrammarCheckResult(results, status='success')
 
 
 def summarise_grammar_issues(matches: list[dict], max_issues: int = 20) -> str:

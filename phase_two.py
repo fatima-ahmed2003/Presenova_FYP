@@ -1,11 +1,10 @@
 """
 Phase Two: Document Analyzer Blueprint (MongoDB & Local Text Extraction)
-Role: Analyze uploaded documents using local text extraction and Google Gemini 1.5 Flash.
+Role: Analyze uploaded documents using local extraction and deterministic quality rules.
 """
 
 import os
 import tempfile
-import json
 import logging
 from datetime import datetime, timezone
 import uuid
@@ -17,14 +16,19 @@ import docx
 from pptx import Presentation as PptxPresentation
 from models import Upload, Report
 from services.text_extractor import validate_file_content
+from services.document_unit_extractor import extract_document_units
+from services.document_unit_checks import analyze_document_units
+from services.document_scoring import score_document_units
+from services.document_ai_suggestions import (
+    analyze_document_with_ai,
+    apply_ai_coherence,
+    sha256_file,
+)
 
 logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
-
-# Gemini API configured globally in ai_evaluator
-
 
 from services.rate_limiter import rate_limit, enforce_guest_size_limit
 
@@ -34,7 +38,7 @@ phase_two_bp = Blueprint('phase_two', __name__, url_prefix='/api')
 
 def extract_text_from_file(file_path: str, file_ext: str) -> str:
     """
-    Extract text content from PDF, DOCX, or TXT file using local libraries.
+    Extract text content from supported PDF, DOCX, PPTX, or TXT files.
     """
     text = ""
     if file_ext == '.pdf':
@@ -49,10 +53,23 @@ def extract_text_from_file(file_path: str, file_ext: str) -> str:
             
     elif file_ext == '.docx':
         try:
+            from docx.oxml.table import CT_Tbl
+            from docx.oxml.text.paragraph import CT_P
+            from docx.table import Table
+            from docx.text.paragraph import Paragraph
+
             doc = docx.Document(file_path)
-            for para in doc.paragraphs:
-                if para.text:
-                    text += para.text + "\n"
+            for block in doc.element.body.iterchildren():
+                if isinstance(block, CT_P):
+                    paragraph = Paragraph(block, doc)
+                    if paragraph.text.strip():
+                        text += paragraph.text.strip() + "\n"
+                elif isinstance(block, CT_Tbl):
+                    table = Table(block, doc)
+                    for row in table.rows:
+                        cells = [cell.text.strip() for cell in row.cells]
+                        if any(cells):
+                            text += " | ".join(cells) + "\n"
         except Exception as e:
             raise ValueError(f"Failed to extract text from DOCX: {str(e)}")
             
@@ -70,10 +87,19 @@ def extract_text_from_file(file_path: str, file_ext: str) -> str:
                     # Extract table text
                     if shape.has_table:
                         for row in shape.table.rows:
-                            for cell in row.cells:
-                                if cell.text.strip():
-                                    text += cell.text.strip() + " "
-                        text += "\n"
+                            cells = [cell.text.strip() for cell in row.cells]
+                            if any(cells):
+                                text += " | ".join(cells) + "\n"
+
+                try:
+                    notes_frame = slide.notes_slide.notes_text_frame
+                    notes = notes_frame.text.strip() if notes_frame else ""
+                    if notes:
+                        text += f"Speaker notes:\n{notes}\n"
+                except (AttributeError, KeyError, ValueError):
+                    # Notes are optional in PPTX; unsupported or absent notes do not
+                    # prevent extraction of the slide's visible content.
+                    pass
         except Exception as e:
             raise ValueError(f"Failed to extract text from PPTX: {str(e)}")
             
@@ -127,8 +153,9 @@ def analyze_document():
     """
     Analyze uploaded document:
     1. Extract text locally.
-    2. Feed to Gemini 2.5 Flash for scoring, feedback, and rewrite.
-    3. Save results and upload metadata to database.
+    2. Score extracted units with deterministic checks.
+    3. Add cached AI suggestions and coherence when a provider succeeds.
+    4. Save results and upload metadata to database.
     """
     # DEBUG_TEMP: remove after caching bug is diagnosed
     logger.info(f"[DEBUG] New analysis triggered, timestamp={datetime.now()}")
@@ -158,7 +185,7 @@ def analyze_document():
             }), 400
         
         # Allowed file extensions & MIME types
-        ALLOWED_EXTENSIONS = {'.pdf', '.pptx', '.docx', '.doc', '.txt'}
+        ALLOWED_EXTENSIONS = {'.pdf', '.pptx', '.docx', '.txt'}
         file_ext = os.path.splitext(file.filename)[1].lower()
         
         if file_ext not in ALLOWED_EXTENSIONS:
@@ -211,13 +238,38 @@ def analyze_document():
                            "Ensure the document contains text and is not password-protected, corrupted, or empty."
             }), 422
             
-        # ===== STEP 4: GENERATE 7Cs ANALYSIS & SUB-ANALYZERS =====
-        from ai_evaluator import evaluate_7cs
-        analysis_json = evaluate_7cs(
-            text=extracted_text,
-            module_type='document',
-            context_metrics={"filename": file.filename}
+        # ===== STEP 4: STRUCTURED RULE CHECKS AND 7Cs SCORING =====
+        try:
+            document_units = extract_document_units(permanent_file_path)
+        except Exception as extraction_error:
+            logger.error(
+                "Structured extraction failed for %s: %s",
+                file.filename,
+                extraction_error,
+            )
+            return jsonify({
+                "success": False,
+                "error": "ExtractionFailed",
+                "message": "Could not extract structured document units.",
+            }), 422
+        if not document_units:
+            return jsonify({
+                "success": False,
+                "error": "ExtractionFailed",
+                "message": "No structured document units were found.",
+            }), 422
+
+        quality_checks = analyze_document_units(document_units)
+        analysis_json = score_document_units(document_units, quality_checks)
+        ai_review = analyze_document_with_ai(
+            document_units,
+            quality_checks,
+            sha256_file(permanent_file_path),
         )
+        apply_ai_coherence(analysis_json, ai_review.get("coherence"))
+        analysis_json.update(ai_review)
+        analysis_json["document_units"] = document_units
+        analysis_json["quality_checks"] = quality_checks
 
         # ===== STEP 5: RUN MULTI-DIMENSIONAL DEEP SUB-ANALYZERS =====
         slides_data = []
@@ -288,19 +340,6 @@ def analyze_document():
         analysis_json["status"] = "success"
         analysis_json["analysis_timestamp"] = datetime.now(timezone.utc).isoformat()
         
-        # Ensure category_scores structure is never undefined
-        if "category_scores" not in analysis_json or not isinstance(analysis_json["category_scores"], dict):
-            analysis_json["category_scores"] = {
-                "Structure": 80,
-                "Clarity": 82,
-                "Persuasion": 78,
-                "Content_Quality": 80,
-                "Grammar_and_Syntax": analysis_json.get("grammar_score", 85),
-                "Accuracy": 84,
-                "Tone_Appropriateness": 82,
-                "Audience_Alignment": 80,
-            }
-        
         # ===== STEP 7: SAVE TO DATABASE (Firestore / In-Memory) =====
         user_id = get_jwt_identity() or "guest"
         
@@ -322,15 +361,6 @@ def analyze_document():
         
         logger.info("Full multi-dimensional analysis complete and saved for: %s", file.filename)
         return jsonify(analysis_json), 200
-        
-    except json.JSONDecodeError as e:
-        logger.error("JSON Parsing Error during document analysis: %s", e)
-        return jsonify({
-            "success": False,
-            "error": "AIModelError",
-            "message": "The AI model returned malformed JSON. Please try again.",
-            "details": str(e)
-        }), 500
         
     except ValueError as e:
         logger.warning("ValueError during document analysis: %s", e)

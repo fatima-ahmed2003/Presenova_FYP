@@ -129,6 +129,13 @@ class PerSlideAnalyzer:
                     normalized['grammar_issues'] = grammar_issues
                     normalized['grammar_issues_count'] = len(grammar_issues)
                     normalized['grammar_score'] = computed_grammar_score
+                    # ANALYSIS_REAL_FIX: this IS a real AI analysis; clear the placeholder flags
+                    normalized['analysis_available'] = True
+                    normalized['error_type'] = None
+                    _ev = normalized.get('seven_cs_evaluation') or {}
+                    normalized['seven_cs_evaluation'] = {
+                        k: ('' if str(v).strip().lower() == 'analysis unavailable.' else v) for k, v in _ev.items()
+                    }
                     return normalized
 
                 # Result came back but wasn't usable (empty dict, or missing

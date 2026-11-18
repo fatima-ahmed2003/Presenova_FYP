@@ -12,6 +12,13 @@ Executes rewrite operations with:
     * suspicious growth or truncation of a paragraph is reverted
 - Change severity classification
 - Honest metrics (how many slides were really rewritten by AI vs fallback)
+
+REFRESH mode (RewriteExecutor(refresh=True)):
+- Replaces generic filler with accurate topic content, design unchanged.
+- ~1 plan call + 1 call per 5 slides (instead of 1 call per slide) so the
+  Gemini free-tier quota (429) is not exhausted.
+- Uses the refresh guard from services/rewrite/refresh.py (numbers may be
+  removed but never invented; per-paragraph length budget; footers locked).
 """
 
 import difflib
@@ -27,12 +34,26 @@ from services.ai.prompts import build_rewrite_prompt
 from services.rewrite.planner import RewritePlanner
 from services.rewrite.smart_filter import SmartFilter
 from services.rewrite.spacy_rewriter import rewrite_slide_dict
+from services.rewrite.refresh import (
+    build_plan_prompt,
+    build_refresh_prompt,
+    chunk_slides,
+    deck_outline,
+    detect_topic,
+    guard_refresh_paragraph,
+    index_plan,
+    index_result,
+    is_locked,  # GAP_DETECTOR
+)
 
 logger = logging.getLogger(__name__)
 
 # Severity thresholds
 SEVERITY_HIGH_CHANGE_RATIO = 0.5  # >50% text changed = major rewrite
 SEVERITY_MODERATE_CHANGE_RATIO = 0.2  # >20% = moderate
+
+# Pause between Gemini calls in refresh mode (seconds) to stay under rate limits
+_REFRESH_CALL_GAP = 1.5
 
 # ── Guard configuration ─────────────────────────────────────────────────────
 # Lines matching these are branding / navigation text. The AI may only fix
@@ -135,10 +156,13 @@ class RewriteExecutor:
         provider: Optional[AIProvider] = None,
         planner: Optional[RewritePlanner] = None,
         smart_filter: Optional[SmartFilter] = None,
+        refresh: bool = False,
     ):
         self.provider = provider or get_provider()
         self.planner = planner or RewritePlanner()
         self.smart_filter = smart_filter or SmartFilter()
+        self.refresh = bool(refresh)
+        self._consec_fail = 0  # GAP_DETECTOR
         self.metrics: dict = {
             'start_time': None,
             'end_time': None,
@@ -154,6 +178,14 @@ class RewriteExecutor:
             'slides_skipped': 0,
             'batches_processed': 0,
             'total_batches': 0,
+            'refresh_mode': self.refresh,
+            # GAP_DETECTOR
+            'slide_status': {},
+            'last_ai_error': '',
+            'ai_failed': False,
+            'no_gaps_found': False,
+            'slide_gaps': {},
+            'deck_gaps': [],
         }
 
     # ------------------------------------------------------------------ #
@@ -179,15 +211,36 @@ class RewriteExecutor:
         """
         self.metrics['start_time'] = time.time()
 
-        # Step 1: Smart filter to identify what needs rewriting
+        # Step 1: Smart filter and refresh-only gap detection.  # GAP_DETECTOR
         to_rewrite, to_skip = self.smart_filter.filter_slides(slides)
+        gap_skipped = []
+        if self.refresh:  # GAP_DETECTOR
+            to_rewrite, to_skip, gap_skipped = self._gap_filter(to_rewrite, to_skip)
         self.metrics['slides_rewritten'] = len(to_rewrite)
         self.metrics['slides_skipped'] = len(to_skip)
 
         if not to_rewrite:
+            self.metrics['no_gaps_found'] = bool(gap_skipped)  # GAP_DETECTOR
             logger.info("[executor] No slides need rewriting; returning originals.")
             self._finalize_metrics()
             return slides, self.metrics
+
+        # REFRESH mode: topic-content refresh with few, batched AI calls
+        if self.refresh:
+            all_rewritten = self._execute_refresh(slides, to_rewrite, presentation_context)
+            # GAP_DETECTOR: retain skipped slides for downstream structural validation.
+            all_rewritten += [self._unchanged_slide(slide) for slide in gap_skipped]
+            all_rewritten.sort(key=lambda result: result.get('slide_number') or 0)
+            self._finalize_metrics()
+            logger.info(
+                "[executor] REFRESH rewrote %d slides (%.1fs) | AI ok=%d, rule-based=%d, "
+                "model calls=%d, guard reverts: %d paragraphs / %d textboxes",
+                len(to_rewrite), self.metrics['total_duration'],
+                self.metrics['ai_slides_succeeded'], self.metrics['rule_based_slides'],
+                self.metrics['model_calls'],
+                self.metrics['guard_reverted_paragraphs'], self.metrics['guard_reverted_textboxes'],
+            )
+            return all_rewritten, self.metrics
 
         # Step 2: Plan batches
         batches = self.planner.plan_batches(to_rewrite)
@@ -217,6 +270,117 @@ class RewriteExecutor:
         )
 
         return all_rewritten, self.metrics
+
+    # ------------------------------------------------------------------ #
+    # REFRESH mode
+    # ------------------------------------------------------------------ #
+    def _generate(self, prompt: str, temperature: float, max_tokens: int):
+        """One provider call; never raises. Circuit breaker after 3 consecutive failures."""
+        if self._consec_fail >= 3:  # GAP_DETECTOR
+            return {}
+        try:
+            result = self.provider.generate_structured(
+                prompt=prompt, temperature=temperature, max_output_tokens=max_tokens,
+            )
+            self.metrics['model_calls'] += 1
+            self._consec_fail = 0  # GAP_DETECTOR
+            return result
+        except Exception as exc:
+            logger.warning("[executor] refresh call failed: %s", exc)
+            self.metrics['retry_count'] += 1
+            self.metrics['last_ai_error'] = str(exc)[:200]  # GAP_DETECTOR
+            self._consec_fail += 1  # GAP_DETECTOR
+            return {}
+
+    # GAP_DETECTOR
+    def _gap_filter(self, to_rewrite: list[dict], to_skip: list[dict]):
+        """Keep only slides with content gaps. Never make refresh fatal."""
+        try:
+            from services.rewrite.gap_detector import analyze_deck
+
+            payload = []
+            for slide in to_rewrite:
+                title = str(slide.get('title') or '').strip()
+                paragraphs = []
+                for textbox in slide.get('textboxes', []) or []:
+                    for paragraph in textbox.get('paragraphs', []) or []:
+                        text = _para_text(paragraph).strip()
+                        if text and text != title and not _is_protected(text) and not is_locked(text):
+                            paragraphs.append(text)
+                payload.append({
+                    'index': slide.get('slide_number'),
+                    'title': title,
+                    'paragraphs': paragraphs,
+                    'notes': slide.get('notes', '') or '',
+                })
+
+            result = analyze_deck(payload, mode='refresh' if self.refresh else 'professional')
+            rewrite_indices = set(result['rewrite_indices'])
+            self.metrics['slide_gaps'] = {
+                str(index): value['gaps'] for index, value in result['slides'].items()
+            }
+            self.metrics['deck_gaps'] = result['deck']
+            kept = [slide for slide in to_rewrite if slide.get('slide_number') in rewrite_indices]
+            dropped = [slide for slide in to_rewrite if slide.get('slide_number') not in rewrite_indices]
+            return kept, list(to_skip) + dropped, dropped
+        except Exception as exc:
+            logger.warning("[executor] gap filter skipped (non-fatal): %s", exc)
+            return to_rewrite, to_skip, []
+
+    def _execute_refresh(
+        self,
+        all_slides: list[dict],
+        to_rewrite: list[dict],
+        presentation_context: Optional[dict],
+    ) -> list[dict]:
+        tone = self.planner.tone
+        topic = detect_topic(all_slides, presentation_context)
+        outline = deck_outline(all_slides)
+        logger.info("[executor] REFRESH topic=%r tone=%r slides=%d", topic, tone, len(to_rewrite))
+
+        # 1 small call: a deck plan so batches stay coherent with each other
+        plan = index_plan(self._generate(build_plan_prompt(topic, tone, all_slides), 0.4, 3072))
+        self.metrics['plan_ok'] = bool(plan)
+        if not plan:
+            logger.warning("[executor] REFRESH plan unavailable; continuing from the deck outline.")
+
+        chunks = chunk_slides(to_rewrite)
+        self.metrics['total_batches'] = len(chunks)
+        results: list[dict] = []
+
+        for chunk in chunks:
+            time.sleep(_REFRESH_CALL_GAP)
+            by_num = index_result(self._generate(
+                build_refresh_prompt(chunk, topic, tone, plan, outline, len(all_slides)),
+                0.4, 8192,
+            ))
+            for slide in chunk:
+                num = slide.get('slide_number')
+                ai_result = by_num.get(num)
+                if ai_result is None:
+                    # one retry for just this slide
+                    time.sleep(_REFRESH_CALL_GAP)
+                    single = index_result(self._generate(
+                        build_refresh_prompt([slide], topic, tone, plan, outline, len(all_slides)),
+                        0.4, 4096,
+                    ))
+                    ai_result = single.get(num)
+                if ai_result is not None:
+                    try:
+                        guarded = self._apply_guards(slide, ai_result, use_refresh=True)
+                        guarded['_change_severity'] = self._classify_severity(slide, guarded)
+                        self.metrics['ai_slides_succeeded'] += 1
+                        self.metrics['slide_status'][num] = 'ai_ok'  # GAP_DETECTOR
+                        results.append(guarded)
+                        continue
+                    except Exception as exc:
+                        logger.error("[executor] REFRESH slide %s guard failed: %s", num, exc)
+                self.metrics['slide_status'][num] = 'ai_failed'  # GAP_DETECTOR
+                results.append(self._fallback_slide(slide, error='refresh call failed'))
+            self.metrics['batches_processed'] += 1
+
+        results.sort(key=lambda r: r.get('slide_number') or 0)
+        return results
 
     # ------------------------------------------------------------------ #
     # Batch / slide execution
@@ -299,13 +463,18 @@ class RewriteExecutor:
     # ------------------------------------------------------------------ #
     # Guards
     # ------------------------------------------------------------------ #
-    def _apply_guards(self, slide: dict, result: dict) -> dict:
+    def _apply_guards(self, slide: dict, result: dict, use_refresh: Optional[bool] = None) -> dict:
         """Validate AI/rule output against the original slide.
 
         - Drops textboxes the AI invented, restores ones it forgot.
         - Reverts a textbox whose paragraph count changed.
-        - Validates every paragraph with `_guard_paragraph`.
+        - Validates every paragraph with the polish guard, or with the
+          refresh guard when `use_refresh` (default: self.refresh) is True.
         """
+        if use_refresh is None:
+            use_refresh = self.refresh
+        guard = guard_refresh_paragraph if use_refresh else _guard_paragraph
+
         result = dict(result)
         result_by_shape = {}
         for tb in result.get('textboxes', []) or []:
@@ -329,7 +498,7 @@ class RewriteExecutor:
                 else:
                     paragraphs = []
                     for o, n in zip(orig_paras, new_paras):
-                        final_text, reverted = _guard_paragraph(o, n)
+                        final_text, reverted = guard(o, n)
                         if reverted:
                             self.metrics['guard_reverted_paragraphs'] += 1
                         paragraphs.append(final_text)
@@ -369,7 +538,8 @@ class RewriteExecutor:
                 mode=self.planner.mode,
                 tone=self.planner.tone,
             )
-            result = self._apply_guards(slide, result)
+            # Rule-based output is a light polish, so it always uses the strict guard.
+            result = self._apply_guards(slide, result, use_refresh=False)
             result['_rule_based'] = True
             self.metrics['rule_based_slides'] += 1
         except Exception as rule_err:

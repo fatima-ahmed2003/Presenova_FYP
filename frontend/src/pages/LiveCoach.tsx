@@ -74,46 +74,70 @@ const LiveCoach: React.FC = () => {
   const [seconds, setSeconds] = useState(0);
   const [answerText, setAnswerText] = useState('');
   const [cameraError, setCameraError] = useState<string | null>(null);
+  const [cameraEnabled, setCameraEnabled] = useState(true);
+  const [cameraRetryKey, setCameraRetryKey] = useState(0);
+  const [videoFile, setVideoFile] = useState<File | null>(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [fullscreenError, setFullscreenError] = useState<string | null>(null);
+  const [liveTip, setLiveTip] = useState({ key: 'ready', title: 'Live Coach', body: 'Look toward the camera when the session begins.' });
 
   // Start screen extras (display only)
   const [checks, setChecks] = useState<boolean[]>(CHECKLIST_ITEMS.map(() => false));
   const [countdown, setCountdown] = useState<number | null>(null);
+  const [readinessError, setReadinessError] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const timerRef = useRef<any>(null);
+  const sessionStartedAtRef = useRef<number | null>(null);
+  const finishRef = useRef<() => void>(() => undefined);
+  const previousTipKeyRef = useRef('');
 
   const {
     status,
     sessionId,
     currentQuestion,
     realtimeFeedback,
+    micActive,
+    micLoading,
+    micError,
     hasHistory,
     historySummary,
     finalReport,
     error,
     sttAvailable,
+    clearVisualFeedback,
     startSession,
     sendAnswer,
     stopSession,
-  } = useLiveSession({ userId, videoRef });
+    toggleMicrophone,
+    retryMicrophone,
+  } = useLiveSession({ userId, videoRef, videoOnly: !!videoFile });
+  const feedbackRef = useRef(realtimeFeedback);
+  feedbackRef.current = realtimeFeedback;
 
-  // Handle timer
+  // Keep elapsed time across Q&A interruptions and finish exactly at 30 minutes.
   useEffect(() => {
-    if (status === 'STREAMING') {
-      timerRef.current = setInterval(() => {
-        setSeconds((prev) => prev + 1);
-      }, 1000);
-    } else {
+    const sessionActive = status === 'STREAMING' || status === 'INTERRUPTED_Q&A';
+    if (!sessionActive) {
       if (timerRef.current) {
         clearInterval(timerRef.current);
         timerRef.current = null;
       }
+      return;
     }
-
+    sessionStartedAtRef.current ??= Date.now();
+    const updateElapsed = () => {
+      const elapsed = Math.min(1800, Math.floor((Date.now() - sessionStartedAtRef.current!) / 1000));
+      setSeconds(elapsed);
+      if (elapsed >= 1800) finishRef.current();
+    };
+    updateElapsed();
+    timerRef.current = window.setInterval(updateElapsed, 250);
     return () => {
       if (timerRef.current) {
         clearInterval(timerRef.current);
+        timerRef.current = null;
       }
     };
   }, [status]);
@@ -134,6 +158,7 @@ const LiveCoach: React.FC = () => {
     if (countdown === null) return;
     if (countdown === 0) {
       setCountdown(null);
+      sessionStartedAtRef.current = null;
       startSession(topic);
       return;
     }
@@ -147,13 +172,36 @@ const LiveCoach: React.FC = () => {
   const handleStart = (e: React.FormEvent) => {
     e.preventDefault();
     if (!topic.trim() || countdown !== null) return;
+    if (!checks.every(Boolean)) {
+      setReadinessError('Please complete all readiness checks');
+      return;
+    }
+    setReadinessError(null);
     setSeconds(0);
+    sessionStartedAtRef.current = null;
     setCameraError(null);
     setCountdown(3);
   };
 
-  const handleFinish = () => {
-    stopSession();
+  const handleFinish = () => stopSession();
+  finishRef.current = handleFinish;
+
+  const handleVideoUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0] || null;
+    event.target.value = '';
+    if (!file) return;
+    if (!file.size) {
+      setCameraError('The selected video is empty. Choose a video with recorded frames.');
+      return;
+    }
+    if (!file.type.startsWith('video/') && !/\.(mp4|webm|mov|m4v|ogg)$/i.test(file.name)) {
+      setCameraError('Choose a supported video file.');
+      return;
+    }
+    setCameraError(null);
+    clearVisualFeedback('Waiting for a readable video frame.');
+    setCameraEnabled(true);
+    setVideoFile(file);
   };
 
   const handleAnswerSubmit = (e: React.FormEvent) => {
@@ -163,48 +211,69 @@ const LiveCoach: React.FC = () => {
     setAnswerText('');
   };
 
-  const handleFullscreen = () => {
+  const handleFullscreen = async () => {
     const el = stageRef.current;
     if (!el) return;
-    if (document.fullscreenElement) {
-      document.exitFullscreen();
-    } else if (el.requestFullscreen) {
-      el.requestFullscreen();
+    setFullscreenError(null);
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else if (el.requestFullscreen) await el.requestFullscreen();
+      else setFullscreenError('Fullscreen is unavailable in this browser.');
+    } catch (err: any) {
+      setFullscreenError(err?.message || 'Could not change fullscreen mode.');
     }
   };
 
+  useEffect(() => {
+    const onFullscreenChange = () => setIsFullscreen(document.fullscreenElement === stageRef.current);
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
+  }, []);
+
   const toggleCheck = (i: number) => {
     setChecks((prev) => prev.map((v, idx) => (idx === i ? !v : v)));
+    setReadinessError(null);
   };
 
   // ===== DOWNLOAD REPORT (single-session — comparison disabled) =====
   const handleDownloadReport = () => {
     if (!v1Report) return;
 
+    const dataQuality = v1Report.session_metrics?.data_quality;
+    const hasAudioMetrics = dataQuality?.has_audio_metrics !== false;
+    const hasGazeMetrics = dataQuality?.has_gaze_metrics ?? (dataQuality?.has_video_metrics !== false);
+    const hasPostureMetrics = dataQuality?.has_posture_metrics ?? (dataQuality?.has_video_metrics !== false);
+    const hasTrackingProxy = dataQuality?.has_tracking_proxy ?? (dataQuality?.has_video_metrics !== false);
+    const hasQnaScores = dataQuality?.has_qna_scores ?? (v1Report.session_metrics?.interruptions_handled ?? 0) > 0;
+    const hasOverallScore = !v1Report.insufficient_data;
+    const categoryScore = (score: number | null | undefined, available: boolean): number | string =>
+      hasOverallScore && available && score !== null && score !== undefined ? score : 'N/A';
+
     const categoryScores = [
-      { name: 'Structure', v1: v1Report.category_scores?.Structure || 0, v2: v1Report.category_scores?.Structure || 0 },
-      { name: 'Clarity', v1: v1Report.category_scores?.Clarity || 0, v2: v1Report.category_scores?.Clarity || 0 },
-      { name: 'Persuasion', v1: v1Report.category_scores?.Persuasion || 0, v2: v1Report.category_scores?.Persuasion || 0 },
-      { name: 'Content Quality', v1: v1Report.category_scores?.Content_Quality || 0, v2: v1Report.category_scores?.Content_Quality || 0 },
-      { name: 'Call to Action', v1: v1Report.category_scores?.Call_to_Action || 0, v2: v1Report.category_scores?.Call_to_Action || 0 },
+      { name: 'Structure', v1: categoryScore(v1Report.category_scores?.Structure, hasAudioMetrics), v2: categoryScore(v1Report.category_scores?.Structure, hasAudioMetrics) },
+      { name: 'Clarity', v1: categoryScore(v1Report.category_scores?.Clarity, hasAudioMetrics), v2: categoryScore(v1Report.category_scores?.Clarity, hasAudioMetrics) },
+      { name: 'Persuasion', v1: categoryScore(v1Report.category_scores?.Persuasion, hasAudioMetrics || hasQnaScores), v2: categoryScore(v1Report.category_scores?.Persuasion, hasAudioMetrics || hasQnaScores) },
+      { name: 'Content Quality', v1: categoryScore(v1Report.category_scores?.Content_Quality, hasAudioMetrics || hasQnaScores), v2: categoryScore(v1Report.category_scores?.Content_Quality, hasAudioMetrics || hasQnaScores) },
+      { name: 'Call to Action', v1: categoryScore(v1Report.category_scores?.Call_to_Action, hasAudioMetrics), v2: categoryScore(v1Report.category_scores?.Call_to_Action, hasAudioMetrics) },
     ];
 
     const additionalMetrics = [
-      { label: 'Average Eye Contact', v1: `${v1Report.session_metrics?.avg_eye_contact ?? 0}%`, v2: `${v1Report.session_metrics?.avg_eye_contact ?? 0}%`, change: '' },
-      { label: 'Body Posture Accuracy', v1: `${v1Report.session_metrics?.avg_posture ?? 0}%`, v2: `${v1Report.session_metrics?.avg_posture ?? 0}%`, change: '' },
-      { label: 'Average Confidence', v1: `${v1Report.session_metrics?.avg_confidence ?? 0}%`, v2: `${v1Report.session_metrics?.avg_confidence ?? 0}%`, change: '' },
-      { label: 'Vocal Pitch Dynamics', v1: `${v1Report.session_metrics?.avg_vocal_pitch ?? 0}%`, v2: `${v1Report.session_metrics?.avg_vocal_pitch ?? 0}%`, change: '' },
-      { label: 'Speaking Pace', v1: `${v1Report.session_metrics?.avg_wpm ?? 0} WPM`, v2: `${v1Report.session_metrics?.avg_wpm ?? 0} WPM`, change: '' },
-      { label: 'Filler Words Count', v1: `${v1Report.session_metrics?.total_fillers ?? 0}`, v2: `${v1Report.session_metrics?.total_fillers ?? 0}`, change: '' },
+      { label: 'Camera-Facing Gaze (Approx.)', v1: hasGazeMetrics && v1Report.session_metrics?.avg_eye_contact != null ? `${v1Report.session_metrics.avg_eye_contact}%` : 'N/A', v2: hasGazeMetrics && v1Report.session_metrics?.avg_eye_contact != null ? `${v1Report.session_metrics.avg_eye_contact}%` : 'N/A', change: '' },
+      { label: 'Upper-Body Posture Estimate', v1: hasPostureMetrics && v1Report.session_metrics?.avg_posture != null ? `${v1Report.session_metrics.avg_posture}%` : 'N/A', v2: hasPostureMetrics && v1Report.session_metrics?.avg_posture != null ? `${v1Report.session_metrics.avg_posture}%` : 'N/A', change: '' },
+      { label: 'Visual Tracking Proxy', v1: hasTrackingProxy && v1Report.session_metrics?.avg_confidence != null ? `${v1Report.session_metrics.avg_confidence}%` : 'N/A', v2: hasTrackingProxy && v1Report.session_metrics?.avg_confidence != null ? `${v1Report.session_metrics.avg_confidence}%` : 'N/A', change: '' },
+      { label: 'Vocal Pitch Dynamics', v1: 'N/A', v2: 'N/A', change: '' },
+      { label: 'Speaking Pace', v1: hasAudioMetrics && v1Report.session_metrics?.avg_wpm != null ? `${v1Report.session_metrics.avg_wpm} WPM` : 'N/A', v2: hasAudioMetrics && v1Report.session_metrics?.avg_wpm != null ? `${v1Report.session_metrics.avg_wpm} WPM` : 'N/A', change: '' },
+      { label: 'Filler Words Count', v1: hasAudioMetrics && v1Report.session_metrics?.total_fillers != null ? `${v1Report.session_metrics.total_fillers}` : 'N/A', v2: hasAudioMetrics && v1Report.session_metrics?.total_fillers != null ? `${v1Report.session_metrics.total_fillers}` : 'N/A', change: '' },
+      { label: 'Face-Frame Coverage', v1: dataQuality?.video_frames_received ? `${dataQuality.video_frames_with_face ?? 0}/${dataQuality.video_frames_received} (${dataQuality.valid_frame_coverage ?? 0}%)` : 'N/A', v2: dataQuality?.video_frames_received ? `${dataQuality.video_frames_with_face ?? 0}/${dataQuality.video_frames_received} (${dataQuality.valid_frame_coverage ?? 0}%)` : 'N/A', change: '' },
       { label: 'Questions Handled', v1: `${v1Report.session_metrics?.interruptions_handled ?? 0}`, v2: `${v1Report.session_metrics?.interruptions_handled ?? 0}`, change: '' },
     ];
 
     downloadProgressReportPDF({
       title: 'Live Presentation Report',
       documentName: v1Topic || v1Report.topic || 'Live Practice Session',
-      v1Score: v1Report.overall_score,
-      v2Score: v1Report.overall_score,
-      gain: 0,
+      v1Score: hasOverallScore ? v1Report.overall_score : 'N/A',
+      v2Score: hasOverallScore ? v1Report.overall_score : 'N/A',
+      gain: hasOverallScore ? 0 : 'N/A',
       categoryScores,
       synthesis: v1Report.detailed_feedback || 'Your live presentation session has been analyzed.',
       improvements: v1Report.recommendations || [],
@@ -218,11 +287,14 @@ const LiveCoach: React.FC = () => {
     setSeconds(0);
     setAnswerText('');
     setCameraError(null);
+    setCameraEnabled(true);
+    setVideoFile(null);
     setV1SessionId(null);
     setV1Report(null);
     setV1Topic('');
     setChecks(CHECKLIST_ITEMS.map(() => false));
     setCountdown(null);
+    sessionStartedAtRef.current = null;
   };
 
   const formatTime = (secs: number) => {
@@ -231,43 +303,99 @@ const LiveCoach: React.FC = () => {
     return `${m}:${s}`;
   };
 
-  const isSessionActive = status === 'STREAMING' || status === 'INTERRUPTED_Q&A' || status === 'REPORT_GENERATING';
+  const isSessionActive = status === 'CONNECTING' || status === 'STREAMING' || status === 'INTERRUPTED_Q&A' || status === 'REPORT_GENERATING';
 
   // ===== Display helpers (read-only, no effect on session logic) =====
   const stream = (videoRef.current?.srcObject as MediaStream | null) || null;
-  const camOn = !!stream && stream.getVideoTracks().some((t) => t.readyState === 'live');
-  const micOn = !!stream && stream.getAudioTracks().some((t) => t.readyState === 'live');
+  const camOn = cameraEnabled && (videoFile
+    ? !!videoRef.current && videoRef.current.readyState >= 2 && !videoRef.current.paused && !videoRef.current.ended
+    : !!stream && stream.getVideoTracks().some((t) => t.readyState === 'live'));
+  const micOn = micActive;
 
-  const eye = Number(realtimeFeedback.eyeContact) || 0;
-  const pos = Number(realtimeFeedback.posture) || 0;
-  const conf = Number(realtimeFeedback.confidence) || 0;
+  const eye = realtimeFeedback.eyeContact ?? 0;
+  const pos = realtimeFeedback.posture ?? 0;
+  const conf = realtimeFeedback.confidence ?? 0;
+  const faceDetected = realtimeFeedback.faceDetected;
+  const gazeAvailable = faceDetected && realtimeFeedback.eyeContact !== null;
+  const postureAvailable = realtimeFeedback.posture !== null;
+  const headMovementAvailable = realtimeFeedback.headMovement !== null;
+  const trackingProxyAvailable = realtimeFeedback.confidence !== null;
+  const displayEmotion = ['smile', 'neutral', 'tense'].includes(realtimeFeedback.emotion.toLowerCase())
+    ? realtimeFeedback.emotion
+    : 'N/A';
 
   const statusNote = (v: number, good: string, ok: string, low: string) =>
     v >= 80 ? good : v >= 60 ? ok : low;
 
-  // Live tip: backend hint first, otherwise a simple rule based on the weakest metric
-  let tipTitle = 'You are doing well';
-  let tipBody = 'Keep your eyes on the camera, sit upright and speak at a steady pace.';
-  if (realtimeFeedback.hint) {
-    tipTitle = 'Live Coach says';
-    tipBody = realtimeFeedback.hint;
-  } else if (eye < 60) {
-    tipTitle = 'Look at the camera';
-    tipBody = 'Your eye contact is low. Look at the camera lens as if it is your audience.';
-  } else if (pos < 60) {
-    tipTitle = 'Sit up straight';
-    tipBody = 'Your posture needs work. Keep your back straight and shoulders relaxed.';
-  } else if (conf < 60) {
-    tipTitle = 'Breathe and slow down';
-    tipBody = 'Take a calm breath and speak slowly. Confidence follows a steady pace.';
-  }
-
-  const frameClass = eye >= 80 ? 'good' : eye >= 60 ? 'mid' : 'low';
+  const frameClass = !gazeAvailable ? 'unavailable' : eye >= 80 ? 'good' : eye >= 60 ? 'mid' : 'low';
 
   const reminders = ['Maintain eye contact', 'Keep good posture', 'Avoid filler words', 'Speak at a steady pace', 'Stay centered'];
 
   const allChecked = checks.every(Boolean);
   const checkedCount = checks.filter(Boolean).length;
+
+  useEffect(() => {
+    if (status !== 'STREAMING' && status !== 'INTERRUPTED_Q&A') return;
+    const refreshTip = () => {
+      const metrics = feedbackRef.current;
+      const candidates: { key: string; title: string; body: string }[] = [];
+      if (metrics.gazeCalibrationStatus === 'calibrating') {
+        candidates.push(
+          { key: 'calibration_a', title: 'Gaze calibration', body: 'Look toward the camera lens while calibration completes.' },
+          { key: 'calibration_b', title: 'Hold your gaze', body: 'Keep looking toward the camera for a few seconds.' },
+        );
+      } else if (!metrics.faceDetected) {
+        candidates.push(
+          { key: 'face_a', title: 'Face not detected', body: 'Move into the frame and improve the light on your face.' },
+          { key: 'face_b', title: 'Adjust the camera', body: 'Center your face in view and keep the lens unobstructed.' },
+        );
+      } else {
+        if (metrics.eyeContact !== null) candidates.push(...(metrics.eyeContact < 65
+          ? [
+            { key: 'gaze_low_a', title: 'Camera-facing gaze', body: 'Bring your gaze back toward the camera when addressing your audience.' },
+            { key: 'gaze_low_b', title: 'Address the lens', body: 'Look toward the camera while making your main points.' },
+          ]
+          : [
+            { key: 'gaze_good_a', title: 'Camera-facing gaze', body: 'Your recent gaze estimate is steady; keep addressing the camera.' },
+            { key: 'gaze_good_b', title: 'Gaze consistency', body: 'Your measured gaze is holding near its calibrated position.' },
+          ]));
+        if (metrics.posture !== null) candidates.push(...(metrics.posture < 65
+          ? [
+            { key: 'posture_low_a', title: 'Upper-body posture', body: 'Level your shoulders and keep your torso upright.' },
+            { key: 'posture_low_b', title: 'Shoulder alignment', body: 'Adjust your shoulders to sit level in the frame.' },
+          ]
+          : [
+            { key: 'posture_good_a', title: 'Upper-body posture', body: 'Your measured upper-body alignment is holding steady.' },
+            { key: 'posture_good_b', title: 'Posture consistency', body: 'Your shoulders and torso remain well aligned in recent frames.' },
+          ]));
+        if (metrics.headMovement !== null) candidates.push(...(metrics.headMovement < 65
+          ? [
+            { key: 'head_low_a', title: 'Head steadiness', body: 'Try reducing repeated head turns while speaking to the camera.' },
+            { key: 'head_low_b', title: 'Head pose variation', body: 'Keep your head orientation steadier for the next few seconds.' },
+          ]
+          : [
+            { key: 'head_good_a', title: 'Head steadiness', body: 'Your head pose has stayed steady across recent frames.' },
+            { key: 'head_good_b', title: 'Head pose control', body: 'Your measured head movement is low over the rolling window.' },
+          ]));
+        if (candidates.length === 0) candidates.push(
+          { key: 'metrics_wait_a', title: 'Keep in frame', body: 'Stay centered while visual measurements become available.' },
+          { key: 'metrics_wait_b', title: 'Improve visibility', body: 'Keep your face and upper body clearly visible to the camera.' },
+        );
+      }
+      const lastKey = previousTipKeyRef.current;
+      let options = candidates.filter((candidate) => candidate.key !== lastKey);
+      if (!options.length) {
+        const previousTitle = liveTip.title;
+        options = candidates.filter((candidate) => candidate.title !== previousTitle);
+      }
+      const tip = options[Math.floor(Math.random() * options.length)] || candidates[0];
+      previousTipKeyRef.current = tip.key;
+      setLiveTip(tip);
+    };
+    refreshTip();
+    const interval = window.setInterval(refreshTip, 5000);
+    return () => window.clearInterval(interval);
+  }, [status]);
 
   return (
     <div className="live-coach-page container lc-page">
@@ -285,11 +413,11 @@ const LiveCoach: React.FC = () => {
       {/* ACTIVE PRESENTATION HUD */}
       {isSessionActive && (
         <>
-          {status === 'STREAMING' && (
+          {(status === 'STREAMING' || status === 'INTERRUPTED_Q&A') && (
             <div className="lc-arena fadeIn">
               {cameraError && (
                 <div className="lc-alert lc-alert-red">
-                  <strong>Camera Access Error:</strong> {cameraError} Please grant camera permissions or ensure no other app is using your webcam.
+                  <strong>Video Source Error:</strong> {cameraError} Check camera permissions or choose a readable video file.
                 </div>
               )}
               {error && (
@@ -297,11 +425,18 @@ const LiveCoach: React.FC = () => {
                   <strong>Session Error:</strong> {error}
                 </div>
               )}
-              {!sttAvailable && (
+              {(!micOn || !sttAvailable) && (
                 <div className="lc-alert lc-alert-amber">
-                  <strong>Voice scoring unavailable:</strong> Speech-to-text isn't configured on the server, so Speaking Pace, Filler Words, and Vocal Pitch Dynamics won't be tracked this session (they'll show 0, not a reflection of your delivery). Eye Contact, Posture, and Confidence are unaffected.
+                  <strong>{!micOn ? 'Microphone is off:' : 'Voice scoring may be unavailable:'}</strong>{' '}
+                  {videoFile
+                    ? 'This upload is analyzed for visible facial and posture cues only; speech metrics are unavailable.'
+                    : !micOn
+                    ? 'WPM, filler words, grammar, and pitch cannot be scored without captured audio.'
+                    : 'Server speech-to-text is unavailable; audio-derived scores require a valid captured transcript.'}
                 </div>
               )}
+              {micError && <div className="lc-alert lc-alert-amber"><strong>Microphone:</strong> {micError}</div>}
+              {fullscreenError && <div className="lc-alert lc-alert-amber"><strong>Fullscreen:</strong> {fullscreenError}</div>}
 
               <div className="lc-main">
                 {/* Camera panel */}
@@ -309,36 +444,63 @@ const LiveCoach: React.FC = () => {
                   <div className="lc-stage" ref={stageRef}>
                     <VideoCapture
                       videoRef={videoRef}
-                      isStreaming={true}
-                      onError={(msg) => setCameraError(msg)}
+                      isStreaming={cameraEnabled}
+                      videoFile={videoFile}
+                      retryKey={cameraRetryKey}
+                      onError={(msg) => { setCameraError(msg); clearVisualFeedback(msg); }}
                     />
                     <LiveFeedbackOverlay
                       eyeContact={realtimeFeedback.eyeContact}
                       posture={realtimeFeedback.posture}
+                      faceDetected={faceDetected}
                       hint={realtimeFeedback.hint}
                       isStreaming={true}
                       confidence={realtimeFeedback.confidence}
-                      emotion={realtimeFeedback.emotion}
+                      emotion={displayEmotion}
+                      gazeCalibrationStatus={realtimeFeedback.gazeCalibrationStatus}
                     />
-                    <div className="lc-live-badge"><span className="lc-live-dot"></span> Live</div>
-                    <div className={`lc-face-frame ${frameClass}`}>
+                    <div className={`lc-live-badge ${!camOn ? 'off' : ''}`}><span className="lc-live-dot"></span> {camOn ? (videoFile ? 'VIDEO' : 'LIVE') : 'CAMERA OFF'}</div>
+                    {camOn && <div className={`lc-face-frame ${frameClass}`}>
                       <i className="tl"></i><i className="tr"></i><i className="bl"></i><i className="br"></i>
-                    </div>
+                    </div>}
+
                   </div>
 
                   <div className="lc-camera-bar">
                     <div className="lc-status-group">
                       <span className="lc-status"><i className={`lc-dot ${camOn ? 'on' : 'off'}`}></i> Camera {camOn ? 'On' : 'Off'}</span>
-                      <span className="lc-status"><i className={`lc-dot ${micOn ? 'on' : 'off'}`}></i> Mic {micOn ? 'On' : 'Off'}</span>
+                      <span className="lc-status"><i className={`lc-dot ${micOn ? 'on' : 'off'}`}></i> Mic {micLoading ? 'Starting…' : micOn ? 'On' : 'Off'}</span>
                     </div>
                     <div className="lc-timer" title="Session duration (Target: 30 minutes)">
                       {formatTime(seconds)} <span>/ 30:00</span>
                     </div>
                     <div className="lc-bar-actions">
-                      <button className="lc-icon-btn" onClick={handleFullscreen} title="Fullscreen">
+                      <button className="lc-icon-btn lc-text-btn" onClick={() => {
+                        setCameraError(null);
+                        clearVisualFeedback('Waiting for a camera frame.');
+                        if (videoFile) {
+                          if (camOn) videoRef.current?.pause();
+                          else setCameraRetryKey((key) => key + 1);
+                        } else if (camOn) setCameraEnabled(false);
+                        else {
+                          setCameraEnabled(true);
+                          setCameraRetryKey((key) => key + 1);
+                        }
+                      }} title={videoFile ? (camOn ? 'Pause video' : 'Play video from the beginning') : camOn ? 'Turn camera off' : 'Start or retry camera'}>
+                        {videoFile ? (camOn ? 'Pause video' : 'Play video') : camOn ? 'Camera off' : 'Camera on'}
+                      </button>
+                      <button className="lc-icon-btn lc-text-btn" onClick={() => micOn || micLoading ? toggleMicrophone() : retryMicrophone()} disabled={!!videoFile} title={videoFile ? 'Microphone is not used while analyzing a video file' : micOn || micLoading ? 'Turn microphone off' : 'Turn microphone on or retry access'}>
+                        {micOn || micLoading ? 'Mic off' : 'Mic on'}
+                      </button>
+                      <label className="lc-icon-btn lc-text-btn lc-upload-btn" title="Analyze a video file">
+                        {videoFile ? 'Change video' : 'Upload video'}
+                        <input type="file" accept="video/*" onChange={handleVideoUpload} style={{ display: 'none' }} />
+                      </label>
+                      {videoFile && <button className="lc-icon-btn lc-text-btn" onClick={() => { clearVisualFeedback('Waiting for a readable camera frame.'); setVideoFile(null); setCameraEnabled(true); }} title="Return to webcam">Use camera</button>}
+                      <button className="lc-icon-btn" onClick={handleFullscreen} title={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'} aria-label={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}>
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3"></path></svg>
                       </button>
-                      <button className="lc-finish-btn" onClick={handleFinish}>Finish Presentation</button>
+                      <button className="lc-finish-btn" onClick={handleFinish} disabled={status === 'REPORT_GENERATING'}>Finish Presentation</button>
                     </div>
                   </div>
                 </div>
@@ -352,12 +514,12 @@ const LiveCoach: React.FC = () => {
                           <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
                         </div>
                         <div className="lc-metric-text">
-                          <div className="lc-metric-num">{eye}%</div>
-                          <div className="lc-metric-name">Eye Contact</div>
+                          <div className="lc-metric-num">{gazeAvailable ? `${eye}%` : 'N/A'}</div>
+                          <div className="lc-metric-name">Camera-Facing Gaze (Approx.)</div>
                         </div>
-                        <Ring value={eye} />
+                        {gazeAvailable && <Ring value={eye} />}
                       </div>
-                      <p>{statusNote(eye, 'Great eye contact! Keep it up.', 'Decent. Look at the camera more.', 'Low. Look at the camera lens.')}</p>
+                      <p>{gazeAvailable ? statusNote(eye, 'Approximate camera-facing gaze detected.', 'Gaze estimate is mixed; look toward the camera when appropriate.', 'Gaze estimate suggests looking away from the camera.') : realtimeFeedback.hint}</p>
                     </div>
 
                     <div className="lc-metric">
@@ -366,12 +528,26 @@ const LiveCoach: React.FC = () => {
                           <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="5" r="2"></circle><path d="M12 7v7M8 10l4-1 4 1M10 21l2-7 2 7"></path></svg>
                         </div>
                         <div className="lc-metric-text">
-                          <div className="lc-metric-num">{pos}%</div>
-                          <div className="lc-metric-name">Posture</div>
+                          <div className="lc-metric-num">{postureAvailable ? `${pos}%` : 'N/A'}</div>
+                          <div className="lc-metric-name">Upper-Body Posture</div>
                         </div>
-                        <Ring value={pos} />
+                        {postureAvailable && <Ring value={pos} />}
                       </div>
-                      <p>{statusNote(pos, 'Good posture! Stay relaxed.', 'Okay. Sit a little straighter.', 'Low. Straighten your back.')}</p>
+                      <p>{postureAvailable ? statusNote(pos, 'Upper-body alignment estimate is high.', 'Upper-body alignment estimate is mixed.', 'Upper-body alignment estimate is low.') : realtimeFeedback.hint}</p>
+                    </div>
+
+                    <div className="lc-metric">
+                      <div className="lc-metric-top">
+                        <div className="lc-metric-icon">
+                          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v3M5.6 5.6l2.1 2.1M3 12h3M5.6 18.4l2.1-2.1M12 18v3M16.3 16.3l2.1 2.1M18 12h3M16.3 7.7l2.1-2.1"/><circle cx="12" cy="12" r="4"/></svg>
+                        </div>
+                        <div className="lc-metric-text">
+                          <div className="lc-metric-num">{headMovementAvailable ? `${realtimeFeedback.headMovement}%` : 'N/A'}</div>
+                          <div className="lc-metric-name">Head Steadiness</div>
+                        </div>
+                        {headMovementAvailable && <Ring value={realtimeFeedback.headMovement!} />}
+                      </div>
+                      <p>{headMovementAvailable ? statusNote(realtimeFeedback.headMovement!, 'Head position is steady across recent frames.', 'Some head movement is visible across recent frames.', 'Frequent head shifts are visible; try keeping your head steadier.') : realtimeFeedback.hint}</p>
                     </div>
 
                     <div className="lc-metric">
@@ -380,12 +556,12 @@ const LiveCoach: React.FC = () => {
                           <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon></svg>
                         </div>
                         <div className="lc-metric-text">
-                          <div className="lc-metric-num">{conf}%</div>
-                          <div className="lc-metric-name">Confidence</div>
+                          <div className="lc-metric-num">{trackingProxyAvailable ? `${conf}%` : 'N/A'}</div>
+                          <div className="lc-metric-name">Visual Tracking Proxy</div>
                         </div>
-                        <Ring value={conf} />
+                        {trackingProxyAvailable && <Ring value={conf} />}
                       </div>
-                      <p>{statusNote(conf, 'You look confident!', 'Fairly confident. Keep going.', 'Take a breath and slow down.')}</p>
+                      <p>{trackingProxyAvailable ? 'Composite of measured gaze and posture availability/stability; not a psychological confidence measure.' : realtimeFeedback.hint}</p>
                     </div>
 
                     <div className="lc-metric">
@@ -394,22 +570,22 @@ const LiveCoach: React.FC = () => {
                           <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><path d="M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01"></path></svg>
                         </div>
                         <div className="lc-metric-text">
-                          <div className="lc-metric-num lc-emotion">{realtimeFeedback.emotion || '--'}</div>
-                          <div className="lc-metric-name">Facial Emotion</div>
+                          <div className="lc-metric-num lc-emotion">{displayEmotion}</div>
+                          <div className="lc-metric-name">Expression Classification</div>
                         </div>
                       </div>
-                      <p>Your detected expression right now.</p>
+                      <p>Expression analysis is unavailable.</p>
                     </div>
                   </div>
 
-                  <div className="lc-tip" key={tipTitle}>
+                  <div className="lc-tip" key={liveTip.key}>
                     <div className="lc-tip-icon">
                       <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.2 1 2V17h6v-.3c0-.8.4-1.5 1-2A7 7 0 0 0 12 2Z"></path></svg>
                     </div>
                     <div>
                       <span className="lc-tip-tag">Live Tip</span>
-                      <h3>{tipTitle}</h3>
-                      <p>{tipBody}</p>
+                      <h3>{liveTip.title}</h3>
+                      <p>{liveTip.body}</p>
                     </div>
                   </div>
 
@@ -439,6 +615,14 @@ const LiveCoach: React.FC = () => {
                   ))}
                 </div>
               </div>
+            </div>
+          )}
+
+          {status === 'CONNECTING' && (
+            <div className="generating-card fadeIn" role="status" aria-live="polite">
+              <div className="spinner-hud"></div>
+              <h2>Connecting to Live Coach</h2>
+              <p>Starting the session and preparing camera and microphone controls…</p>
             </div>
           )}
 
@@ -475,8 +659,9 @@ const LiveCoach: React.FC = () => {
           {status === 'REPORT_GENERATING' && (
             <div className="generating-card fadeIn">
               <div className="spinner-hud"></div>
-              <h2>Compiling Presentation Analytics</h2>
-              <p>Processing vocal dynamics, eye-gaze tracking frames, and panel responses...</p>
+              <h2>{error ? 'Report generation needs another try' : 'Compiling Presentation Analytics'}</h2>
+              <p>{error || 'Processing measured camera, microphone, and panel data…'}</p>
+              {error && <button className="lc-finish-btn" onClick={handleFinish}>Retry report generation</button>}
             </div>
           )}
         </>
@@ -508,7 +693,7 @@ const LiveCoach: React.FC = () => {
                 <span className="coach-badge">LIVE PRACTICE SESSION</span>
                 <h1>Interactive Presentation Practice</h1>
                 <p className="lc-start-sub">
-                  Enter a presentation topic. The coach will track your visual presence, eye contact, posture, and pacing.
+                  Enter a presentation topic. The coach estimates camera-facing gaze, scores posture only when upper-body landmarks are visible, and tracks pacing when valid speech is transcribed.
                   An academic panel will occasionally interrupt you with real-time questions to test your depth.
                 </p>
 
@@ -517,7 +702,7 @@ const LiveCoach: React.FC = () => {
                     type="text"
                     placeholder="e.g., Blockchain Scaling, Machine Learning in Health..."
                     value={topic}
-                    onChange={(e) => setTopic(e.target.value)}
+                    onChange={(e) => { setTopic(e.target.value); setReadinessError(null); }}
                     required
                     className="lc-topic-input"
                   />
@@ -545,14 +730,19 @@ const LiveCoach: React.FC = () => {
                     </div>
                     {CHECKLIST_ITEMS.map((item, i) => (
                       <label key={item} className={`lc-check ${checks[i] ? 'done' : ''}`}>
-                        <input type="checkbox" checked={checks[i]} onChange={() => toggleCheck(i)} />
+                        <input type="checkbox" checked={checks[i]} required onChange={() => toggleCheck(i)} />
                         <span className="lc-check-box"></span>
                         <span>{item}</span>
                       </label>
                     ))}
                   </div>
 
-                  <button type="submit" className={`lc-start-btn ${allChecked && topic.trim() ? 'ready' : ''}`}>
+                  {(!allChecked || readinessError) && (
+                    <p role="alert" style={{ color: '#fbbf24', margin: 0 }}>
+                      {readinessError || 'Please complete all readiness checks'}
+                    </p>
+                  )}
+                  <button type="submit" disabled={!topic.trim() || !allChecked || countdown !== null} className={`lc-start-btn ${allChecked && topic.trim() ? 'ready' : ''}`}>
                     {allChecked && topic.trim() ? 'You are ready. Start Practice Session' : 'Start Practice Session'}
                   </button>
                 </form>
@@ -563,15 +753,15 @@ const LiveCoach: React.FC = () => {
                   <div className="lc-feature-icon">
                     <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
                   </div>
-                  <h3>Eye Contact</h3>
-                  <p>Tracks where you look and tells you when you drift away from the camera.</p>
+                  <h3>Camera-Facing Gaze (Approx.)</h3>
+                  <p>Face landmarks estimate camera-facing gaze; this does not verify true eye contact.</p>
                 </div>
                 <div className="lc-feature">
                   <div className="lc-feature-icon">
                     <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="5" r="2"></circle><path d="M12 7v7M8 10l4-1 4 1M10 21l2-7 2 7"></path></svg>
                   </div>
-                  <h3>Posture and Confidence</h3>
-                  <p>Live scores for your body language, updated every second.</p>
+                  <h3>Upper-Body Posture</h3>
+                  <p>Posture is scored only when visible shoulder and hip landmarks are available. Visual tracking is not psychological confidence.</p>
                 </div>
                 <div className="lc-feature">
                   <div className="lc-feature-icon">
