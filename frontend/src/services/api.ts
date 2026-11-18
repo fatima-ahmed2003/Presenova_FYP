@@ -532,7 +532,7 @@ export const healthCheck = async (): Promise<boolean> => {
 /**
  * Finalizes the live session and retrieves compiled feedback
  */
-export const submitPresentationSession = async (sessionId: string): Promise<{ status: string; report: any }> => {
+export const submitPresentationSession = async (sessionId: string): Promise<{ status: string; report?: any; message?: string }> => {
   try {
     const response = await fetchWithAuth(`${API_BASE_URL}/presentation/submit`, {
       method: 'POST',
