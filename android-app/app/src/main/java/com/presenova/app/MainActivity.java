@@ -58,7 +58,7 @@ import java.util.List;
 import java.util.concurrent.Executor;
 
 public class MainActivity extends Activity {
-    private static final String HOME = "https://cerulean-pavlova-319933.netlify.app/";
+    private static final String HOME = "https://presenova-frontend.onrender.com/";
     private static final int FILE_PICKER = 41;
     private static final int MEDIA_PERMISSION = 42;
     private WebView webView;
@@ -106,7 +106,7 @@ public class MainActivity extends Activity {
 
         if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
             WebViewCompat.addWebMessageListener(webView, "PresenovaDownloads",
-                java.util.Collections.singleton("https://cerulean-pavlova-319933.netlify.app"),
+                new java.util.HashSet<>(java.util.Arrays.asList("https://presenova-frontend.onrender.com", "https://cerulean-pavlova-319933.netlify.app")),
                 (view, message, sourceOrigin, isMainFrame, replyProxy) -> {
                     if (!isMainFrame || !isTrusted(sourceOrigin)) return;
                     try {
@@ -115,7 +115,7 @@ public class MainActivity extends Activity {
                     } catch (Exception e) { Toast.makeText(MainActivity.this, "Could not save download", Toast.LENGTH_LONG).show(); }
                 });
             WebViewCompat.addWebMessageListener(webView, "PresenovaAuth",
-                java.util.Collections.singleton("https://cerulean-pavlova-319933.netlify.app"),
+                new java.util.HashSet<>(java.util.Arrays.asList("https://presenova-frontend.onrender.com", "https://cerulean-pavlova-319933.netlify.app")),
                 (view, message, sourceOrigin, isMainFrame, replyProxy) -> {
                     if (!isMainFrame || !isTrusted(sourceOrigin) || !isTrusted(Uri.parse(view.getUrl() == null ? "" : view.getUrl()))) return;
                     if (!"google-sign-in".equals(message.getData())) return;
@@ -417,7 +417,12 @@ public class MainActivity extends Activity {
         return name;
     }
 
-    private boolean isTrusted(Uri uri) { return "https".equalsIgnoreCase(uri.getScheme()) && "cerulean-pavlova-319933.netlify.app".equalsIgnoreCase(uri.getHost()); }
+    private boolean isTrusted(Uri uri) {
+        if (!"https".equalsIgnoreCase(uri.getScheme())) return false;
+        String host = uri.getHost();
+        return "presenova-frontend.onrender.com".equalsIgnoreCase(host)
+            || "cerulean-pavlova-319933.netlify.app".equalsIgnoreCase(host);
+    }
     private boolean hasInternet() {
         ConnectivityManager cm = (ConnectivityManager)getSystemService(Context.CONNECTIVITY_SERVICE);
         android.net.Network network = cm.getActiveNetwork();

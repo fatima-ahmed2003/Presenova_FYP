@@ -184,6 +184,10 @@ def create_app():
     cors_origins_env = os.getenv('CORS_ORIGINS', '').strip()
     if cors_origins_env and cors_origins_env != '*':
         parsed_origins = [o.strip() for o in cors_origins_env.split(',') if o.strip()]
+        parsed_origins.extend([
+            'https://presenova-frontend.onrender.com',
+            'https://cerulean-pavlova-319933.netlify.app',
+        ])
         import re
         parsed_origins.append(re.compile(r"^https://.*\.vercel\.app$"))
         parsed_origins.append(re.compile(r"^https://.*\.web\.app$"))
@@ -193,8 +197,19 @@ def create_app():
     else:
         parsed_origins = "*"
 
-    # For SocketIO, cors_allowed_origins must be strings or '*'
+    # Keep wildcard deployments working; explicitly allow both frontend origins
+    # and local development when a deployment configures a restricted CORS list.
     socketio_origins = '*'
+    if cors_origins_env and cors_origins_env != '*':
+        socketio_origins = list(dict.fromkeys([
+            *[o.strip() for o in cors_origins_env.split(',') if o.strip()],
+            'https://presenova-frontend.onrender.com',
+            'https://cerulean-pavlova-319933.netlify.app',
+            'http://localhost:3000',
+            'http://localhost:5173',
+            'http://127.0.0.1:3000',
+            'http://127.0.0.1:5173',
+        ]))
 
     CORS(
         app,

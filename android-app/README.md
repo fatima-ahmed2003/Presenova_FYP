@@ -1,6 +1,6 @@
 # Presenova Android WebView app
 
-Native Android wrapper for the live Presenova site at `https://cerulean-pavlova-319933.netlify.app/`. The app loads the live origin so website releases appear without rebuilding the APK. Firebase authentication runs through the website's configured Firebase Web SDK; WebView cookies and DOM storage are enabled for persistent browser sessions. No backend credentials or API keys are included here.
+Native Android wrapper for the live Presenova site at `https://presenova-frontend.onrender.com/`. The app loads the live origin so website releases appear without rebuilding the APK. Firebase authentication runs through the website's configured Firebase Web SDK; WebView cookies and DOM storage are enabled for persistent browser sessions. No backend credentials or API keys are included here.
 
 Features include origin-restricted WebView navigation, Android camera and microphone runtime permission prompts for trusted-site requests, Android document picker uploads, DownloadManager downloads, blob download saving into `Downloads/Presenova`, an offline/retry screen, loading progress, and Android back navigation. WebSocket support is provided by Android WebView's browser engine.
 
