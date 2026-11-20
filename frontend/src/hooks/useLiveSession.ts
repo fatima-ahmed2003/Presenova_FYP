@@ -23,6 +23,13 @@ export interface UseLiveSessionProps {
   videoOnly?: boolean;
 }
 
+interface MicrophoneAcquisition {
+  promise: Promise<MediaStream>;
+  stream: MediaStream | null;
+  leases: number;
+  settled: boolean;
+}
+
 export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveSessionProps) => {
   const [status, setStatus] = useState<SessionStatus>('IDLE');
   const statusRef = useRef<SessionStatus>('IDLE');
@@ -74,6 +81,10 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
 
   const socketRef = useRef<Socket | null>(null);
   const sessionIdRef = useRef<string | null>(null);
+  const sessionStartTimerRef = useRef<any>(null);
+  const sessionStartAttemptRef = useRef(0);
+  const sentStartAttemptRef = useRef(0);
+  const pendingStartRef = useRef<{ attempt: number; payload: { user_id: string; topic: string } } | null>(null);
   const isFinishingRef = useRef(false);
   const videoIntervalRef = useRef<any>(null);
   const videoFrameInFlightRef = useRef<number | null>(null);
@@ -86,6 +97,63 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
   const audioRmsIntervalRef = useRef<any>(null);
   const audioRmsSamplesRef = useRef<number[]>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const microphoneRequestRef = useRef<MicrophoneAcquisition | null>(null);
+  const firstFrameSentRef = useRef(false);
+
+  const releaseMicrophoneAcquisition = (acquisition: MicrophoneAcquisition, releaseAll = false) => {
+    acquisition.leases = releaseAll ? 0 : Math.max(0, acquisition.leases - 1);
+    if (acquisition.leases === 0) {
+      if (acquisition.stream) {
+        acquisition.stream.getTracks().forEach((track) => track.stop());
+        if (audioStreamRef.current === acquisition.stream) audioStreamRef.current = null;
+      }
+      if (acquisition.settled && microphoneRequestRef.current === acquisition) {
+        microphoneRequestRef.current = null;
+      }
+    }
+  };
+
+  const clearSessionStartTimer = () => {
+    if (sessionStartTimerRef.current) {
+      clearTimeout(sessionStartTimerRef.current);
+      sessionStartTimerRef.current = null;
+    }
+  };
+
+  const failSessionStart = (message: string) => {
+    if (statusRef.current !== 'CONNECTING') return;
+    clearSessionStartTimer();
+    pendingStartRef.current = null;
+    statusRef.current = 'IDLE';
+    setError(message);
+    setStatus('IDLE');
+  };
+
+  const handleSessionStarted = (data: any) => {
+    if (statusRef.current !== 'CONNECTING') return;
+    if (data?.status === 'success' && typeof data.session_id === 'string' && data.session_id) {
+      clearSessionStartTimer();
+      pendingStartRef.current = null;
+      sessionIdRef.current = data.session_id;
+      setSessionId(data.session_id);
+      setHasHistory(data.has_history === true);
+      setHistorySummary(data.history_summary || null);
+      setSttAvailable(data.stt_available !== false);
+      statusRef.current = 'STREAMING';
+      setStatus('STREAMING');
+      return;
+    }
+    failSessionStart(data?.message || 'The Live Coach server rejected the session request. Please try again.');
+  };
+
+  const emitStartSession = (socket: Socket, attempt: number) => {
+    const pending = pendingStartRef.current;
+    if (!pending || pending.attempt !== attempt || sentStartAttemptRef.current === attempt || !socket.connected) return;
+    sentStartAttemptRef.current = attempt;
+    socket.emit('start_session', pending.payload, (ack: any) => {
+      if (ack) handleSessionStarted(ack);
+    });
+  };
 
   // Initialize socket connection
   const connectSocket = () => {
@@ -100,36 +168,26 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
       (window.location.hostname === 'localhost' ||
        window.location.hostname === '127.0.0.1' ||
        window.location.hostname === '::1');
+    const isPresenovaAndroidApp = typeof window !== 'undefined' && Boolean((window as any).PresenovaAuth);
 
     const socket = io(`${socketHost}/ws/live-session`, {
-      // In local dev on Werkzeug server, use polling to prevent Werkzeug's websocket upgrade ConnectionError crash
-      transports: isLocalDev ? ['polling'] : ['websocket', 'polling'],
+      // Polling first keeps WebView startup reliable while still upgrading to WebSocket when available.
+      transports: isLocalDev || isPresenovaAndroidApp ? ['polling', 'websocket'] : ['websocket', 'polling'],
       upgrade: !isLocalDev,
       reconnection: true,
       reconnectionAttempts: 20,
       reconnectionDelay: 1000,
       reconnectionDelayMax: 5000,
-      timeout: 60000,
+      timeout: 15000,
     });
 
     socket.on('connect', () => {
       console.log('Connected to live session socket namespace');
+      const pending = pendingStartRef.current;
+      if (pending) emitStartSession(socket, pending.attempt);
     });
 
-    socket.on('session_started', (data: any) => {
-      console.log('Session started event:', data);
-      if (data.status === 'success') {
-        setSessionId(data.session_id);
-        sessionIdRef.current = data.session_id;
-        setHasHistory(data.has_history);
-        setHistorySummary(data.history_summary);
-        setSttAvailable(data.stt_available !== false);
-        setStatus('STREAMING');
-      } else {
-        setError('Failed to start session');
-        setStatus('IDLE');
-      }
-    });
+    socket.on('session_started', handleSessionStarted);
 
     socket.on('realtime_feedback', (data: any) => {
       if (typeof data.frame_id === 'number') {
@@ -184,16 +242,22 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
       videoAckSupportedRef.current = null;
       if (videoFrameAckTimerRef.current) clearTimeout(videoFrameAckTimerRef.current);
       if (statusRef.current === 'CONNECTING' || statusRef.current === 'STREAMING' || statusRef.current === 'INTERRUPTED_Q&A') {
-        setError('Lost real-time connection to the live coach server. Reconnecting...');
-        if (statusRef.current === 'CONNECTING') setStatus('IDLE');
+        if (statusRef.current === 'CONNECTING') {
+          failSessionStart('Connection to Live Coach was interrupted before the session started. Please retry.');
+        } else {
+          setError('Lost real-time connection to the live coach server. Reconnecting...');
+        }
       }
     });
 
     socket.on('connect_error', (err: any) => {
       console.error('Socket connection error:', err);
       if (statusRef.current === 'CONNECTING' || statusRef.current === 'STREAMING' || statusRef.current === 'INTERRUPTED_Q&A') {
-        setError('Unable to reach the live coach server. Please check that the server is running.');
-        if (statusRef.current === 'CONNECTING') setStatus('IDLE');
+        if (statusRef.current === 'CONNECTING') {
+          failSessionStart('Unable to connect to the Live Coach server. Check your connection and retry.');
+        } else {
+          setError('Unable to reach the live coach server. Please check your connection.');
+        }
       }
     });
 
@@ -206,21 +270,29 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
     setFinalReport(null);
     setSessionId(null);
     sessionIdRef.current = null;
+    firstFrameSentRef.current = false;
+    const attempt = ++sessionStartAttemptRef.current;
+    sentStartAttemptRef.current = 0;
+    pendingStartRef.current = {
+      attempt,
+      payload: { user_id: userId || 'guest', topic: topic.trim() },
+    };
     videoFrameInFlightRef.current = null;
     videoAckSupportedRef.current = null;
     if (videoFrameAckTimerRef.current) clearTimeout(videoFrameAckTimerRef.current);
     lastFeedbackFrameRef.current = 0;
     isFinishingRef.current = false;
     clearVisualFeedback('Preparing session...');
+    statusRef.current = 'CONNECTING';
     setStatus('CONNECTING');
     connectSocket();
-    
-    if (socketRef.current) {
-      socketRef.current.emit('start_session', {
-        user_id: userId || 'guest',
-        topic: topic,
-      });
-    }
+    if (socketRef.current?.connected) emitStartSession(socketRef.current, attempt);
+    clearSessionStartTimer();
+    sessionStartTimerRef.current = window.setTimeout(() => {
+      if (sessionStartAttemptRef.current === attempt) {
+        failSessionStart('Live Coach did not confirm the session within 30 seconds. Please check the connection and retry.');
+      }
+    }, 30_000);
   };
 
   // Send answer to academic panelist interruption
@@ -237,6 +309,8 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
   const stopSession = async () => {
     if (!sessionId || isFinishingRef.current) return;
     isFinishingRef.current = true;
+    clearSessionStartTimer();
+    pendingStartRef.current = null;
     setStatus('REPORT_GENERATING');
     
     // Clear intervals and recorder
@@ -308,6 +382,7 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
       audioStreamRef.current.getTracks().forEach((track) => track.stop());
       audioStreamRef.current = null;
     }
+    if (microphoneRequestRef.current) releaseMicrophoneAcquisition(microphoneRequestRef.current, true);
     setMicActive(false);
     setMicLoading(false);
   };
@@ -315,7 +390,7 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
   // Loop for video frames and audio chunks streaming
   useEffect(() => {
     let audioActive = true;
-    let localAudioStream: MediaStream | null = null;
+    let localMicrophoneAcquisition: MicrophoneAcquisition | null = null;
 
     const sessionActive = status === 'STREAMING' || status === 'INTERRUPTED_Q&A';
     if (sessionActive && sessionId && videoRef.current) {
@@ -325,7 +400,7 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
 
       videoIntervalRef.current = setInterval(() => {
         const video = videoRef.current;
-        if (video && ctx && socketRef.current && ['STREAMING', 'INTERRUPTED_Q&A'].includes(statusRef.current)) {
+        if (video && ctx && socketRef.current?.connected && ['STREAMING', 'INTERRUPTED_Q&A'].includes(statusRef.current)) {
           // Guard: Only capture when camera stream is actively delivering frames with valid dimensions
           const canSendFrame = videoAckSupportedRef.current === false || videoFrameInFlightRef.current === null;
           if (canSendFrame && !video.paused && !video.ended && video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
@@ -338,12 +413,17 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
             const frameId = Math.round(performance.now());
             const expectsAck = videoAckSupportedRef.current !== false;
             if (expectsAck) videoFrameInFlightRef.current = frameId;
+            if (!firstFrameSentRef.current) {
+              firstFrameSentRef.current = true;
+              setRealtimeFeedback((current) => ({ ...current, hint: 'Camera frame sent; waiting for visual feedback.' }));
+            }
             socketRef.current.emit('video_frame', {
               session_id: sessionId,
               frame: frameBase64,
               frame_id: frameId,
-            }, () => {
+            }, (ack: any) => {
               videoAckSupportedRef.current = true;
+              if (ack?.dropped) setRealtimeFeedback((current) => ({ ...current, hint: 'Frame reached the server; analysis is busy. Waiting for the next frame.' }));
               if (videoFrameAckTimerRef.current) clearTimeout(videoFrameAckTimerRef.current);
               videoFrameAckTimerRef.current = null;
               if (videoFrameInFlightRef.current === frameId) videoFrameInFlightRef.current = null;
@@ -357,7 +437,7 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
                   videoFrameInFlightRef.current = null;
                 }
                 videoFrameAckTimerRef.current = null;
-              }, 750);
+              }, 3000);
             }
           }
         }
@@ -374,13 +454,32 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
         setMicError('Microphone access is unavailable in this browser or page context.');
       } else {
         setMicLoading(true);
-        navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
-        if (!audioActive) {
-          stream.getTracks().forEach((track) => track.stop());
-          return;
+        let acquisition = microphoneRequestRef.current;
+        if (!acquisition) {
+          acquisition = {
+            promise: navigator.mediaDevices.getUserMedia({ audio: true }),
+            stream: null,
+            leases: 0,
+            settled: false,
+          };
+          microphoneRequestRef.current = acquisition;
+          const pendingAcquisition = acquisition;
+          pendingAcquisition.promise.then((stream) => {
+            pendingAcquisition.stream = stream;
+            pendingAcquisition.settled = true;
+            if (pendingAcquisition.leases === 0) releaseMicrophoneAcquisition(pendingAcquisition, true);
+          }, () => {
+            pendingAcquisition.settled = true;
+            if (pendingAcquisition.leases === 0 && microphoneRequestRef.current === pendingAcquisition) {
+              microphoneRequestRef.current = null;
+            }
+          });
         }
+        acquisition.leases += 1;
+        localMicrophoneAcquisition = acquisition;
+        acquisition.promise.then((stream) => {
+        if (!audioActive || microphoneRequestRef.current !== acquisition || acquisition.leases === 0) return;
         audioStreamRef.current = stream;
-        localAudioStream = stream;
         setMicLoading(false);
         setMicActive(true);
         setMicError(null);
@@ -428,6 +527,9 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
         } catch (signalError) {
           console.warn('Microphone signal sampling unavailable:', signalError);
         }
+        if (audioContextRef.current?.state === 'suspended') {
+          void audioContextRef.current.resume().catch(() => undefined);
+        }
 
         mediaRecorder.ondataavailable = async (e) => {
           try {
@@ -457,9 +559,19 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
         // Record in 3-second slices natively
         try {
           mediaRecorder.start(3000);
-          mediaRecorder.onerror = () => {
+        mediaRecorder.onerror = () => {
+          if (audioRmsIntervalRef.current) clearInterval(audioRmsIntervalRef.current);
+          audioRmsIntervalRef.current = null;
+          if (audioContextRef.current) {
+            void audioContextRef.current.close().catch(() => undefined);
+            audioContextRef.current = null;
+          }
+          stream.getTracks().forEach((track) => track.stop());
+          if (audioStreamRef.current === stream) audioStreamRef.current = null;
+          if (mediaRecorderRef.current === mediaRecorder) mediaRecorderRef.current = null;
             setMicError('Microphone recording stopped unexpectedly.');
             setMicActive(false);
+          setMicLoading(false);
           };
         } catch (recorderError: any) {
           stream.getTracks().forEach((track) => track.stop());
@@ -477,6 +589,10 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
         setMicError(err?.message || 'Microphone access was denied or is unavailable.');
         setMicActive(false);
         setMicLoading(false);
+      }).finally(() => {
+        if (acquisition.settled && acquisition.leases === 0 && microphoneRequestRef.current === acquisition) {
+          microphoneRequestRef.current = null;
+        }
       });
       }
     } else {
@@ -485,20 +601,36 @@ export const useLiveSession = ({ userId, videoRef, videoOnly = false }: UseLiveS
 
     return () => {
       audioActive = false;
-      if (audioStreamRef.current) {
-        audioStreamRef.current.getTracks().forEach((track) => track.stop());
-        audioStreamRef.current = null;
+      if (localMicrophoneAcquisition) releaseMicrophoneAcquisition(localMicrophoneAcquisition);
+      if (videoIntervalRef.current) {
+        clearInterval(videoIntervalRef.current);
+        videoIntervalRef.current = null;
       }
-      if (localAudioStream) {
-        (localAudioStream as MediaStream).getTracks().forEach((track) => track.stop());
+      if (videoFrameAckTimerRef.current) {
+        clearTimeout(videoFrameAckTimerRef.current);
+        videoFrameAckTimerRef.current = null;
       }
-      stopMediaStreaming();
+      if (audioRmsIntervalRef.current) {
+        clearInterval(audioRmsIntervalRef.current);
+        audioRmsIntervalRef.current = null;
+      }
+      if (audioContextRef.current) {
+        void audioContextRef.current.close().catch(() => undefined);
+        audioContextRef.current = null;
+      }
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        mediaRecorderRef.current.ondataavailable = null;
+        try { mediaRecorderRef.current.stop(); } catch { /* The stream tracks are stopped during cleanup. */ }
+      }
+      mediaRecorderRef.current = null;
     };
   }, [status === 'STREAMING' || status === 'INTERRUPTED_Q&A', sessionId, videoRef, videoOnly, micEnabled, micRetryKey]);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
+      clearSessionStartTimer();
+      pendingStartRef.current = null;
       stopMediaStreaming();
       if (socketRef.current) {
         if (sessionIdRef.current) {

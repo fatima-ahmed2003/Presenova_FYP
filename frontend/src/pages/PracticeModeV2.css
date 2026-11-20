@@ -435,11 +435,22 @@
 @media (max-width: 1000px) {
   .da3-practice .da3-layout { grid-template-columns: 1fr; }
   .da3-practice .da3-side { position: static; }
-  .da3-practice .da3-chat { height: 640px; }
+  .da3-practice .da3-chat { height: min(640px, calc(100dvh - 190px)); min-height: 400px; }
 }
 @media (max-width: 600px) {
   .da3-practice { padding: 20px 12px 40px; }
   .da3-practice .practice-header h1 { font-size: 1.6rem; }
   .da3-practice .message-bubble { max-width: 94%; }
   .da3-practice .message-avatar { display: none; }
+  .da3-practice .da3-chat { height: min(620px, calc(100dvh - 175px)); min-height: 380px; border-radius: 15px; }
+  .da3-practice .da3-chat-head { padding: 10px 12px; gap: 8px; }
+  .da3-practice .da3-chat-head-left { gap: 9px; min-width: 0; }
+  .da3-practice .da3-chat-title { font-size: .9rem; }
+  .da3-practice .da3-chat-sub { font-size: .7rem; }
+  .da3-practice .da3-ghost-btn { min-height: 40px; padding: 7px 10px; white-space: nowrap; }
+  .da3-practice .da3-input { padding: 10px 12px max(12px, env(safe-area-inset-bottom)); }
+  .da3-practice .message-input { padding: 10px 11px; font-size: 16px; }
+  .da3-practice .da3-input-actions button { min-height: 42px; padding: 9px 16px; }
+  .da3-practice .error-message-box { margin: 0 10px 8px; padding: 9px 10px; font-size: .78rem; }
+  .da3-practice .message-bubble { overflow-wrap: anywhere; line-height: 1.5; }
 }

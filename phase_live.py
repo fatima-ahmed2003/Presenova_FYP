@@ -792,13 +792,15 @@ def init_socketio_events(socketio):
                 "top_recommendations": last_rep.get("recommendations", [])[:2]
             }
 
-        socketio.emit('session_started', {
+        session_data = {
             "status": "success",
             "session_id": session.id,
             "has_history": has_history,
             "history_summary": history_summary,
             "stt_available": groq_client is not None
-        }, room=request.sid, namespace='/ws/live-session')
+        }
+        socketio.emit('session_started', session_data, room=request.sid, namespace='/ws/live-session')
+        return session_data
 
     @socketio.on('video_frame', namespace='/ws/live-session')
     def on_video_frame(data):

@@ -4,6 +4,65 @@ import {
   GoogleAuthProvider,
 } from 'firebase/auth';
 
+type NativeGoogleBridge = {
+  postMessage: (message: string) => void;
+  addEventListener: (type: 'message', listener: (event: MessageEvent<string>) => void) => void;
+  removeEventListener: (type: 'message', listener: (event: MessageEvent<string>) => void) => void;
+};
+
+export const hasNativeGoogleSignIn = (): boolean => {
+  return typeof window !== 'undefined' && Boolean((window as any).PresenovaAuth);
+};
+
+export const requestNativeGoogleIdToken = (): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const bridge = (window as any).PresenovaAuth as NativeGoogleBridge | undefined;
+    if (!bridge || typeof bridge.postMessage !== 'function') {
+      reject(Object.assign(new Error('Native Google sign-in is unavailable.'), { code: 'native/unavailable' }));
+      return;
+    }
+
+    let settled = false;
+    let timeout = 0;
+    const cleanup = () => {
+      window.clearTimeout(timeout);
+      bridge.removeEventListener('message', onMessage);
+    };
+    const fail = (code: string) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      const messages: Record<string, string> = {
+        cancelled: 'Google sign-in was cancelled.',
+        timeout: 'Google sign-in timed out. Please try again.',
+        configuration: 'Google sign-in is not configured for this Android app yet.',
+        credential: 'Google did not return a valid sign-in credential.',
+        'in-progress': 'A Google sign-in is already in progress.',
+        unavailable: 'Google sign-in is temporarily unavailable. Please try again.',
+      };
+      reject(Object.assign(new Error(messages[code] || messages.unavailable), { code: `native/${code}` }));
+    };
+    const onMessage = (event: MessageEvent<string>) => {
+      let response: { type?: unknown; code?: unknown; idToken?: unknown };
+      try { response = JSON.parse(event.data); } catch { return; }
+      if (response.type === 'error' && typeof response.code === 'string') {
+        fail(response.code);
+      } else if (response.type === 'success' && typeof response.idToken === 'string' && response.idToken.length > 0 && response.idToken.length <= 16384) {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(response.idToken);
+      } else {
+        fail('credential');
+      }
+    };
+    timeout = window.setTimeout(() => fail('timeout'), 65_000);
+    bridge.addEventListener('message', onMessage);
+    try { bridge.postMessage('google-sign-in'); }
+    catch { fail('unavailable'); }
+  });
+};
+
 // FIX-4 (AGENTS.md §2): Never hardcode Firebase project credentials as fallbacks —
 // they leak project IDs into the production JS bundle even when minified.
 // Use isFirebaseConfigured() guard before calling signInWithPopup / signInWithRedirect.

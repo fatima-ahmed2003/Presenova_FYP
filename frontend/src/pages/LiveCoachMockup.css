@@ -165,10 +165,28 @@
   .lc-bar-actions { width: 100%; justify-content: flex-start; gap: .45rem; }
   .lc-upload-btn { min-width: 106px; }
 }
-@media (max-width: 440px) {
+@media (max-width: 359px) {
   .lc-metrics { grid-template-columns: 1fr; }
   .lc-countdown-num { font-size: 7rem; }
 }
 .lc-countdown-topic { color: #c4b5fd; margin: 0; }
 .lc-countdown-cancel { margin-top: 1rem; padding: 0.6rem 1.6rem; border-radius: 10px; border: 1px solid rgba(239,68,68,0.5); background: transparent; color: #f87171; cursor: pointer; font-weight: 600; }
 .lc-countdown-cancel:hover { background: rgba(239,68,68,0.12); }
+
+@media (max-width: 600px) {
+  .lc-stage { aspect-ratio: 4 / 3; max-height: min(68vh, 440px); }
+  .lc-stage > div { min-height: 0 !important; }
+  .lc-stage video { object-fit: contain; }
+  .lc-metrics { gap: .5rem; }
+  .lc-metric { min-height: 0; padding: .7rem; border-radius: 13px; }
+  .lc-metric-icon { width: 34px; height: 34px; }
+  .lc-metric-num { font-size: 1.35rem; }
+  .lc-metric-num.lc-emotion { font-size: .95rem; }
+  .lc-metric-name { font-size: .73rem; }
+  .lc-metric p { margin-top: .45rem; font-size: .74rem; line-height: 1.35; }
+  .lc-critical-warning { bottom: 8px; max-width: calc(100% - 16px); padding: .42rem .55rem; font-size: .72rem; }
+  .lc-feedback-overlay { padding: 7px; }
+  .lc-feedback-hud { max-width: 65%; grid-template-columns: repeat(3, minmax(52px, 1fr)); gap: .25rem !important; }
+  .lc-feedback-hint { max-width: 48% !important; padding: .4rem .5rem !important; font-size: .72rem; }
+  .lc-text-btn { min-height: 42px; }
+}

@@ -26,11 +26,15 @@ import {
   getFirebaseErrorMessage, 
   isElectron, 
   isFirebaseConfigured,
+  hasNativeGoogleSignIn,
+  requestNativeGoogleIdToken,
   sendFirebasePasswordReset
 } from '../services/firebase';
 import { 
+  GoogleAuthProvider,
   signInWithPopup, 
   signInWithRedirect,
+  signInWithCredential,
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
   updateProfile
@@ -38,6 +42,14 @@ import {
 import './Login.css';
 
 type FormTab = 'login' | 'signup' | 'forgot-password';
+
+const withTimeout = <T,>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> => new Promise((resolve, reject) => {
+  const timeout = window.setTimeout(() => reject(Object.assign(new Error(message), { code: 'auth/timeout' })), timeoutMs);
+  operation.then(
+    (value) => { window.clearTimeout(timeout); resolve(value); },
+    (error) => { window.clearTimeout(timeout); reject(error); }
+  );
+});
 
 const Login: React.FC = () => {
   const navigate = useNavigate();
@@ -90,8 +102,8 @@ const Login: React.FC = () => {
   const handleFirebaseTokenExchange = async (firebaseUser: any) => {
     try {
       setMessage('Verifying session with Presenova server...');
-      const idToken = await firebaseUser.getIdToken(true);
-      const response = await firebaseLogin(idToken);
+      const idToken = await withTimeout<string>(firebaseUser.getIdToken(true), 30_000, 'Firebase session verification timed out. Please try again.');
+      const response = await withTimeout(firebaseLogin(idToken), 90_000, 'Presenova server verification timed out. Please try again.');
 
       // Save Flask JWT in AuthContext
       loginContext(response.user, response.access_token, response.refresh_token);
@@ -101,7 +113,6 @@ const Login: React.FC = () => {
         navigate('/analytics');
       }, 800);
     } catch (err: any) {
-      console.error('Firebase token exchange failed:', err);
       const errMsg = err?.message || 'Server verification failed. Please try again.';
       setError(errMsg);
     }
@@ -109,7 +120,7 @@ const Login: React.FC = () => {
 
   /**
    * Handle Google Sign-In
-   * Uses popup for Web browser and redirect fallback for Electron runtime
+   * Uses native Credential Manager in the Android wrapper and browser auth elsewhere.
    */
   const handleGoogleSignIn = async () => {
     setError(null);
@@ -124,19 +135,35 @@ const Login: React.FC = () => {
 
     try {
       let userCredential;
-      if (isElectron()) {
+      if (hasNativeGoogleSignIn()) {
+        const idToken = await requestNativeGoogleIdToken();
+        const firebaseCredential = GoogleAuthProvider.credential(idToken);
+        userCredential = await withTimeout(
+          signInWithCredential(auth, firebaseCredential),
+          60_000,
+          'Firebase Google authentication timed out. Please try again.'
+        );
+      } else if (isElectron()) {
         await signInWithRedirect(auth, googleProvider);
         return;
       } else {
-        userCredential = await signInWithPopup(auth, googleProvider);
+        userCredential = await withTimeout(
+          signInWithPopup(auth, googleProvider),
+          60_000,
+          'Google sign-in timed out. Please try again.'
+        );
       }
 
       if (userCredential?.user) {
         await handleFirebaseTokenExchange(userCredential.user);
       }
     } catch (err: any) {
-      console.error('Google sign-in error:', err);
-      setError(getFirebaseErrorMessage(err));
+      const friendlyError = err?.code === 'auth/account-exists-with-different-credential'
+        ? 'An account with this email already uses another sign-in method. Sign in with that method first.'
+        : err?.code?.startsWith('native/') || err?.code === 'auth/timeout'
+          ? (err?.message || 'Google sign-in failed. Please try again.')
+          : getFirebaseErrorMessage(err);
+      setError(friendlyError);
     } finally {
       setIsLoading(false);
     }

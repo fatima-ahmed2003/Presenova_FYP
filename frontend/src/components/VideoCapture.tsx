@@ -172,7 +172,6 @@ const containerStyle: React.CSSProperties = {
 const videoStyle: React.CSSProperties = {
   width: '100%',
   height: '100%',
-  objectFit: 'cover',
   transform: 'scaleX(-1)', // Mirror effect for user convenience
 };
 

@@ -28,8 +28,13 @@ const renderHighlighted = (text: string): React.ReactNode[] => {
 };
 
 const convertToMonoWav = async (audioBlob: Blob): Promise<Blob> => {
-  const audioContext = new AudioContext();
+  const AudioContextCtor = window.AudioContext || (window as any).webkitAudioContext;
+  if (!AudioContextCtor) throw new Error('Audio conversion is not supported in this browser.');
+  const audioContext: AudioContext = new AudioContextCtor();
   try {
+    if (audioContext.state === 'suspended') {
+      await audioContext.resume().catch(() => undefined);
+    }
     const decoded = await audioContext.decodeAudioData(await audioBlob.arrayBuffer());
     const sampleRate = 16000;
     const frameCount = Math.ceil(decoded.duration * sampleRate);
@@ -195,6 +200,7 @@ const SpeechAnalyzer: React.FC = () => {
 
   // Common UI / Recording State
   const [isRecording, setIsRecording] = useState(false);
+  const [isStarting, setIsStarting] = useState(false);
   const [duration, setDuration] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -207,18 +213,31 @@ const SpeechAnalyzer: React.FC = () => {
   const audioChunksRef = useRef<Blob[]>([]);
   const timerIntervalRef = useRef<any | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const isStartingRef = useRef(false);
+  const mountedRef = useRef(true);
 
   // ===== CLEANUP ON COMPONENT UNMOUNT =====
   useEffect(() => {
+    mountedRef.current = true;
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setError('Web Audio Recording is not supported in this browser. Please use Chrome, Firefox, or Edge.');
     }
     return () => {
+      mountedRef.current = false;
+      isStartingRef.current = false;
       if (timerIntervalRef.current) {
         clearInterval(timerIntervalRef.current);
       }
+      const recorder = mediaRecorderRef.current;
+      if (recorder && recorder.state !== 'inactive') {
+        recorder.ondataavailable = null;
+        recorder.onstop = null;
+        try { recorder.stop(); } catch { /* Stream tracks below still release the microphone. */ }
+      }
+      mediaRecorderRef.current = null;
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
       }
     };
   }, []);
@@ -251,6 +270,7 @@ const SpeechAnalyzer: React.FC = () => {
 
   // ===== START/STOP RECORDING =====
   const handleToggleRecording = async () => {
+    if (isStartingRef.current) return;
     setError(null);
     if (isRecording) {
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
@@ -267,11 +287,22 @@ const SpeechAnalyzer: React.FC = () => {
       setHasRecordedAudio(false);
       setDiagnosticAudioUrl(null);
       setAudioDiagnostics(null);
+      isStartingRef.current = true;
+      setIsStarting(true);
       let acquiredStream: MediaStream | null = null;
       try {
         acquiredStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        if (!mountedRef.current) {
+          acquiredStream.getTracks().forEach((track) => track.stop());
+          return;
+        }
         streamRef.current = acquiredStream;
-        const mediaRecorder = new MediaRecorder(acquiredStream);
+        const preferredMime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4']
+          .find((mime) => MediaRecorder.isTypeSupported?.(mime));
+        const mediaRecorder = new MediaRecorder(
+          acquiredStream,
+          preferredMime ? { mimeType: preferredMime } : undefined
+        );
         mediaRecorderRef.current = mediaRecorder;
         mediaRecorder.ondataavailable = (event) => {
           if (event.data.size > 0) {
@@ -280,9 +311,21 @@ const SpeechAnalyzer: React.FC = () => {
           setHasRecordedAudio(audioChunksRef.current.length > 0);
         };
         mediaRecorder.onstop = () => {
-          if (streamRef.current) {
-            streamRef.current.getTracks().forEach((track) => track.stop());
+          acquiredStream?.getTracks().forEach((track) => track.stop());
+          if (streamRef.current === acquiredStream) {
             streamRef.current = null;
+          }
+          if (mediaRecorderRef.current === mediaRecorder) mediaRecorderRef.current = null;
+        };
+        mediaRecorder.onerror = () => {
+          mediaRecorder.ondataavailable = null;
+          try { if (mediaRecorder.state !== 'inactive') mediaRecorder.stop(); } catch { /* Track cleanup follows. */ }
+          acquiredStream?.getTracks().forEach((track) => track.stop());
+          if (streamRef.current === acquiredStream) streamRef.current = null;
+          if (mediaRecorderRef.current === mediaRecorder) mediaRecorderRef.current = null;
+          if (mountedRef.current) {
+            setIsRecording(false);
+            setError('Microphone recording stopped unexpectedly. Please try again.');
           }
         };
         mediaRecorder.start();
@@ -293,8 +336,12 @@ const SpeechAnalyzer: React.FC = () => {
           streamRef.current = null;
         }
         mediaRecorderRef.current = null;
-        console.error('Microphone error:', err);
-        setError('Microphone access denied or unavailable. Please connect a microphone and check permissions.');
+        if (mountedRef.current) {
+          setError('Microphone access denied or unavailable. Allow microphone access in Android settings and try again.');
+        }
+      } finally {
+        isStartingRef.current = false;
+        if (mountedRef.current) setIsStarting(false);
       }
     }
   };
@@ -336,8 +383,14 @@ const SpeechAnalyzer: React.FC = () => {
 
   // ===== CLEAR =====
   const handleClear = () => {
-    if (isRecording && mediaRecorderRef.current) {
-      mediaRecorderRef.current.stop();
+    const recorder = mediaRecorderRef.current;
+    if (recorder) {
+      recorder.ondataavailable = null;
+      recorder.onstop = null;
+      if (recorder.state !== 'inactive') {
+        try { recorder.stop(); } catch { /* Tracks below still release the microphone. */ }
+      }
+      mediaRecorderRef.current = null;
     }
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
@@ -668,14 +721,14 @@ const SpeechAnalyzer: React.FC = () => {
 
         <div className="sa-actions">
           <Button
-            label={isRecording ? 'Stop Recording' : 'Start Recording'}
+            label={isStarting ? 'Requesting Microphone…' : isRecording ? 'Stop Recording' : 'Start Recording'}
             onClick={handleToggleRecording}
-            disabled={loading}
+            disabled={loading || isStarting}
           />
           {hasRecordedAudio && !isRecording && (
             <>
               <Button label="Analyze Speech" onClick={handleAnalyze} loading={loading} />
-              <Button label="Clear" onClick={handleClear} variant="secondary" disabled={loading} />
+              <Button label="Clear" onClick={handleClear} variant="secondary" disabled={loading || isStarting} />
             </>
           )}
         </div>
